@@ -1,0 +1,7 @@
+{
+  "default": "allow",
+  "rules": [
+    { "tool": "fs.delete", "decision": "deny" },
+    { "tool": "fs.write", "decision": "prompt" }
+  ]
+}
