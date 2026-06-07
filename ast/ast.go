@@ -346,6 +346,32 @@ func (pe *ParallelExpression) String() string {
 	return out.String()
 }
 
+// RetryExpression is `retry (<Attempts>) <Body>` (DESIGN.md §3, §8). Attempts is
+// the maximum number of tries (an expression that must evaluate to a positive
+// integer). Body is re-evaluated up to Attempts times while it yields an error;
+// the expression's value is the first success, or the last error. Like `if`,
+// `parallel`, and `fn` it is an expression (it yields a value).
+type RetryExpression struct {
+	spanned
+	Token    token.Token // the 'retry' token
+	Attempts Expression
+	Body     *BlockStatement
+}
+
+func (re *RetryExpression) expressionNode()      {}
+func (re *RetryExpression) TokenLiteral() string { return re.Token.Literal }
+func (re *RetryExpression) String() string {
+	var out strings.Builder
+	out.WriteString("retry (")
+	if re.Attempts != nil {
+		out.WriteString(re.Attempts.String())
+	}
+	out.WriteString(") { ")
+	out.WriteString(re.Body.String())
+	out.WriteString(" }")
+	return out.String()
+}
+
 // FunctionLiteral is `fn(<Parameters>) <Body>`.
 type FunctionLiteral struct {
 	spanned

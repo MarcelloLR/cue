@@ -120,6 +120,37 @@ func TestParallelParses(t *testing.T) {
 	}
 }
 
+func TestRetryParses(t *testing.T) {
+	cases := []struct {
+		input string
+		want  string
+	}{
+		{"retry (3) { f() }", "retry (3) { f() }"},
+		{"retry (n) { tool.go() }", "retry (n) { (tool.go)() }"},
+		// The leading '(' opens paren-depth, so a newline in the head continues.
+		{"retry (\n3\n) { f() }", "retry (3) { f() }"},
+	}
+	for _, c := range cases {
+		if got := parse(t, c.input); got != c.want {
+			t.Errorf("parse(%q) = %q, want %q", c.input, got, c.want)
+		}
+	}
+}
+
+func TestRetryMalformedYieldsDiagnostic(t *testing.T) {
+	for _, src := range []string{
+		"retry 3 { f() }",  // missing parens
+		"retry (3)",        // missing body
+		"retry () { f() }", // missing attempts expr
+	} {
+		p := New(lexer.New(src))
+		p.ParseProgram()
+		if !p.HasErrors() {
+			t.Errorf("expected a diagnostic for %q", src)
+		}
+	}
+}
+
 func TestParallelMalformedYieldsDiagnostic(t *testing.T) {
 	cases := []struct {
 		name string

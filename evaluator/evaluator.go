@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,6 +28,7 @@ import (
 	"github.com/MarcelloLR/cue/diag"
 	"github.com/MarcelloLR/cue/object"
 	"github.com/MarcelloLR/cue/runtime/effectlog"
+	"github.com/MarcelloLR/cue/runtime/llm"
 	"github.com/MarcelloLR/cue/runtime/policy"
 	"github.com/MarcelloLR/cue/runtime/registry"
 	"github.com/MarcelloLR/cue/token"
@@ -72,6 +74,21 @@ type Interp struct {
 	// CLI points it at stderr so stdout carries only the machine-readable envelope:
 	// the run output must stay parseable by the agent (DESIGN.md §9).
 	Out io.Writer
+	// In is where ask_human reads a line of human input from. It defaults to
+	// os.Stdin; a harness (or a test) supplies any reader. Prompts are written to
+	// Out, never to In (DESIGN.md §8).
+	In io.Reader
+	// LLM is the provider the `llm()` primitive calls. It defaults to an offline,
+	// deterministic llm.MockProvider so tests and examples need no network or API
+	// key; a real provider is swapped in at construction (DESIGN.md §8, §14).
+	LLM llm.Provider
+	// promptLock serializes the human-prompt critical section (ask_human and the
+	// interactive Prompter) across all sibling Interps. It is shared by reference:
+	// New() allocates one and every `parallel` child Interp copies the same pointer,
+	// so concurrent branches that prompt block on one another and stdin never
+	// interleaves (DESIGN.md §6). A nil lock means "no serialization needed" (a bare
+	// Interp literal), which the prompt helpers tolerate.
+	promptLock *sync.Mutex
 }
 
 // Option configures an Interp at construction.
@@ -96,17 +113,27 @@ func WithBranch(branch string) Option { return func(i *Interp) { i.Branch = bran
 // WithOutput sets the writer `print` writes to. Defaults to os.Stdout.
 func WithOutput(w io.Writer) Option { return func(i *Interp) { i.Out = w } }
 
+// WithInput sets the reader ask_human reads a line from. Defaults to os.Stdin.
+func WithInput(r io.Reader) Option { return func(i *Interp) { i.In = r } }
+
+// WithLLM sets the provider the `llm()` primitive calls. Defaults to an offline,
+// deterministic llm.MockProvider.
+func WithLLM(p llm.Provider) Option { return func(i *Interp) { i.LLM = p } }
+
 // New returns an Interp with sensible defaults: a background context, the
 // allow-all policy, a fresh effect recorder, and the "root" branch. Options
 // override these.
 func New(opts ...Option) *Interp {
 	i := &Interp{
-		Ctx:      context.Background(),
-		Policy:   policy.AllowAll{},
-		Prompter: policy.DenyPrompter{},
-		Effects:  effectlog.NewRecorder(),
-		Branch:   "root",
-		Out:      os.Stdout,
+		Ctx:        context.Background(),
+		Policy:     policy.AllowAll{},
+		Prompter:   policy.DenyPrompter{},
+		Effects:    effectlog.NewRecorder(),
+		Branch:     "root",
+		Out:        os.Stdout,
+		In:         os.Stdin,
+		LLM:        llm.MockProvider{},
+		promptLock: &sync.Mutex{},
 	}
 	for _, opt := range opts {
 		opt(i)
@@ -131,6 +158,72 @@ func (s *syncWriter) Write(p []byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.w.Write(p)
+}
+
+// promptLine is the single human-prompt critical section shared by ask_human and
+// the interactive Prompter (DESIGN.md §6, §8). It holds the global prompt lock so
+// concurrent `parallel` branches serialize, writes the question to Out, and reads
+// one line from In. Sibling Interps share the same lock/In/Out by reference, so the
+// whole run prompts on one channel without interleaving.
+func (i *Interp) promptLine(question string) (string, error) {
+	if i.promptLock != nil {
+		i.promptLock.Lock()
+		defer i.promptLock.Unlock()
+	}
+	if question != "" {
+		fmt.Fprint(i.Out, question)
+	}
+	return readLine(i.In)
+}
+
+// readLine reads a single newline-terminated line from r, one byte at a time so a
+// shared reader (os.Stdin across branches) is never over-read past the line. A
+// final line without a trailing newline is returned on EOF; a CRLF is normalized.
+func readLine(r io.Reader) (string, error) {
+	if r == nil {
+		return "", io.EOF
+	}
+	var b []byte
+	buf := make([]byte, 1)
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			if buf[0] == '\n' {
+				return strings.TrimSuffix(string(b), "\r"), nil
+			}
+			b = append(b, buf[0])
+		}
+		if err != nil {
+			if err == io.EOF && len(b) > 0 {
+				return strings.TrimSuffix(string(b), "\r"), nil
+			}
+			return "", err
+		}
+	}
+}
+
+// interactivePrompter resolves a policy Prompt by asking a yes/no question on the
+// Interp's prompt channel — under the same lock ask_human uses — so a confirmation
+// and a concurrent ask_human never interleave (DESIGN.md §6, §7). This is what
+// makes ask_human "the interactive Prompter" the policy layer routes Prompt to.
+type interactivePrompter struct{ interp *Interp }
+
+// NewInteractivePrompter returns a policy.Prompter that confirms via i's prompt
+// channel (stdin/Out). The CLI installs it for `cue run`; tests inject a
+// policy.FuncPrompter instead so they never block on real input.
+func NewInteractivePrompter(i *Interp) policy.Prompter { return &interactivePrompter{interp: i} }
+
+func (p *interactivePrompter) Confirm(name string, args []object.Object) (bool, error) {
+	line, err := p.interp.promptLine(fmt.Sprintf("Policy requires confirmation to run %q. Allow? [y/N] ", name))
+	if err != nil {
+		return false, err
+	}
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "y", "yes":
+		return true, nil
+	default:
+		return false, nil
+	}
 }
 
 // Eval evaluates a node in env using a default Interp. It preserves the Phase 0
@@ -210,6 +303,8 @@ func (i *Interp) Eval(node ast.Node, env *object.Environment) object.Object {
 		return i.evalForExpression(node, env)
 	case *ast.ParallelExpression:
 		return i.evalParallelExpression(node, env)
+	case *ast.RetryExpression:
+		return i.evalRetryExpression(node, env)
 	case *ast.CallExpression:
 		return i.evalCallExpression(node, env)
 	case *ast.IndexExpression:
@@ -326,10 +421,16 @@ func (i *Interp) evalIdentifier(node *ast.Identifier, env *object.Environment) o
 	if val, ok := env.Get(node.Value); ok {
 		return val
 	}
-	// `print` is the one builtin whose behaviour depends on run state (where its
-	// output goes), so it is built per-Interp rather than living in the shared map.
-	if node.Value == "print" {
+	// A handful of builtins depend on run state (where output goes, where input
+	// comes from, the configured llm provider, the policy/effect path), so they are
+	// built per-Interp rather than living in the shared, stateless map.
+	switch node.Value {
+	case "print":
 		return i.printBuiltin()
+	case "ask_human":
+		return i.askHumanBuiltin(node)
+	case "llm":
+		return i.llmBuiltin(node)
 	}
 	if b, ok := builtins[node.Value]; ok {
 		return b
@@ -599,6 +700,13 @@ func (i *Interp) evalParallelExpression(node *ast.ParallelExpression, env *objec
 				Effects:  i.Effects,
 				Branch:   i.branchLabel(k),
 				Out:      i.Out,
+				// In, LLM, and promptLock are shared by reference across siblings:
+				// the same *sync.Mutex serializes every branch's human-prompt
+				// critical section so concurrent ask_human calls (and interactive
+				// policy prompts) never interleave on stdin (DESIGN.md §6).
+				In:         i.In,
+				LLM:        i.LLM,
+				promptLock: i.promptLock,
 			}
 
 			result := child.Eval(node.Body, branchEnv)
@@ -697,6 +805,54 @@ func (i *Interp) parallelLimit(node *ast.ParallelExpression, env *object.Environ
 	return int(n.Value), nil
 }
 
+// evalRetryExpression runs the retry form `retry (n) { body }` (DESIGN.md §3, §8).
+// It evaluates the attempt count (which must be a positive *object.Integer, else
+// CUE_TYPE_*), then re-evaluates body up to n times while it yields an
+// *object.Error, returning the first non-error result or — if every attempt errors
+// — the LAST error. A `return` inside the body unwinds to its value, like any other
+// expression body. Backoff is intentionally none by default so tests are
+// deterministic and fast and never depend on wall-clock time; a real deployment
+// that wants spacing between attempts would add it behind an explicit, off-by-
+// default knob.
+//
+// IDEMPOTENCY HAZARD (DESIGN.md §8): each attempt re-evaluates the whole body, so
+// every effectful call inside it is re-logged and re-run on every retry. Retrying a
+// body that performs a non-idempotent or irreversible tool call (e.g. fs.delete, a
+// POST that charges money) can repeat that effect — retry pairs with Phase 3
+// reversibility/compensation precisely because of this. Prefer retrying bodies
+// whose tool calls are idempotent or reversible.
+func (i *Interp) evalRetryExpression(node *ast.RetryExpression, env *object.Environment) object.Object {
+	attempts := i.Eval(node.Attempts, env)
+	if isError(attempts) {
+		return attempts
+	}
+	n, ok := attempts.(*object.Integer)
+	if !ok {
+		return newError(node.Attempts, diag.TypeMismatch,
+			"retry attempts must be INTEGER, got %s", attempts.Type())
+	}
+	if n.Value <= 0 {
+		return newError(node.Attempts, diag.TypeMismatch,
+			"retry attempts must be a positive integer, got %d", n.Value)
+	}
+
+	var last object.Object = NULL
+	for attempt := int64(0); attempt < n.Value; attempt++ {
+		// A fresh enclosed env per attempt so a `let` in the body does not leak a
+		// rebinding across retries.
+		result := i.Eval(node.Body, object.NewEnclosedEnvironment(env))
+		if rv, ok := result.(*object.ReturnValue); ok {
+			result = rv.Value
+		}
+		if !isError(result) {
+			return result
+		}
+		last = result
+	}
+	// Every attempt errored: surface the last error (DESIGN.md §8).
+	return last
+}
+
 func (i *Interp) evalCallExpression(node *ast.CallExpression, env *object.Environment) object.Object {
 	fn := i.Eval(node.Function, env)
 	if isError(fn) {
@@ -765,40 +921,14 @@ func (i *Interp) invokeTool(node *ast.CallExpression, tool *object.Tool, args []
 	// The base record shared by every outcome (allow/deny/error/ok). Filled in
 	// per outcome below. The callsite is the deterministic key the effect log
 	// (and, later, replay) uses instead of the scheduling-dependent Seq.
-	rec := effectlog.Record{
-		Callsite:   callsite(node),
-		Branch:     i.Branch,
-		Tool:       impl.Name(),
-		Args:       renderArgs(args),
-		Reversible: rev == object.Reversible,
-	}
+	rec := i.newRecord(node, impl.Name(), args, rev == object.Reversible)
 
-	// Policy gate. Deny is a learnable boundary (CUE_CAP_001); Prompt routes
-	// through the Prompter seam (CUE_CAP_002 when it declines or is absent). A
-	// blocked call is recorded with status "denied" and NOT invoked.
-	switch i.Policy.Check(impl.Name(), args, rev) {
-	case policy.Deny:
-		return i.recordDenied(node, rec, diag.CapDenied,
-			"%s: denied by policy", impl.Name())
-	case policy.Prompt:
-		prompter := i.Prompter
-		if prompter == nil {
-			prompter = policy.DenyPrompter{}
-		}
-		ok, perr := prompter.Confirm(impl.Name(), args)
-		if perr != nil {
-			return i.recordDenied(node, rec, diag.CapPromptRequired,
-				"%s: confirmation failed: %s", impl.Name(), perr.Error())
-		}
-		if !ok {
-			if _, deny := prompter.(policy.DenyPrompter); deny {
-				return i.recordDenied(node, rec, diag.CapPromptRequired,
-					"%s: policy requires confirmation; no prompter configured", impl.Name())
-			}
-			return i.recordDenied(node, rec, diag.CapPromptRequired,
-				"%s: confirmation declined", impl.Name())
-		}
-		// Confirmed: fall through to Invoke.
+	// Policy gate (the shared pipeline llm() also uses): Deny is a learnable
+	// boundary (CUE_CAP_001); Prompt routes through the Prompter seam (CUE_CAP_002
+	// when it declines or is absent). A blocked call is recorded with status
+	// "denied" and NOT invoked.
+	if denied := i.gate(node, rec, impl.Name(), args, rev); denied != nil {
+		return denied
 	}
 
 	start := time.Now()
@@ -806,18 +936,12 @@ func (i *Interp) invokeTool(node *ast.CallExpression, tool *object.Tool, args []
 	rec.DurationMs = time.Since(start).Milliseconds()
 
 	if err != nil {
-		msg := err.Error()
-		rec.Status = "error"
-		rec.Error = &msg
-		i.Effects.Append(rec)
-		return newError(node, diag.ToolFailure, "%s", msg)
+		return i.recordError(node, rec, err.Error())
 	}
 
 	if result == nil {
 		result = NULL
 	}
-	rec.Status = "ok"
-	rec.Result = object.ToAny(result)
 	// Capture the inverse action for a successful reversible call so a later phase
 	// can roll it back (DESIGN.md §7). Capture only; firing is Phase 5.
 	if comp, ok := impl.(object.Compensator); ok {
@@ -825,14 +949,85 @@ func (i *Interp) invokeTool(node *ast.CallExpression, tool *object.Tool, args []
 			rec.Compensation = &effectlog.Compensation{Tool: cTool, Args: renderArgs(cArgs)}
 		}
 	}
-	i.Effects.Append(rec)
+	i.recordOK(rec, result)
 	return result
+}
+
+// --- shared effect-logging pipeline (DESIGN.md §7) ---
+//
+// Tools, llm(), and ask_human() all touch the outside world and so all flow
+// through one place rather than re-implementing policy/record logic: invokeTool
+// builds the full pipeline (gate → Invoke → record); llm() reuses gate +
+// recordError/recordOK; ask_human() reuses newRecord + recordOK (it is logged but
+// not gated, being itself the escalation target of a Prompt). Keeping this single
+// keeps the §10 replay key — (Branch, Callsite, Occurrence) — consistent across
+// every effect kind.
+
+// newRecord builds the base effect record common to every outcome: the
+// deterministic callsite key, the branch label, the tool name, the rendered args,
+// and the reversibility flag (DESIGN.md §7).
+func (i *Interp) newRecord(node ast.Node, name string, args []object.Object, reversible bool) effectlog.Record {
+	return effectlog.Record{
+		Callsite:   callsite(node),
+		Branch:     i.Branch,
+		Tool:       name,
+		Args:       renderArgs(args),
+		Reversible: reversible,
+	}
+}
+
+// gate runs the policy check for a call. It returns nil to proceed, or a
+// CUE_CAP_* error (after recording the blocked attempt as a "denied" effect) when
+// the policy denies or a required confirmation is not granted. The tool's Invoke
+// is never reached on a non-nil return — the safe-by-construction guarantee
+// (DESIGN.md §7, §9).
+func (i *Interp) gate(node ast.Node, rec effectlog.Record, name string, args []object.Object, rev object.Reversibility) object.Object {
+	switch i.Policy.Check(name, args, rev) {
+	case policy.Deny:
+		return i.recordDenied(node, rec, diag.CapDenied, "%s: denied by policy", name)
+	case policy.Prompt:
+		prompter := i.Prompter
+		if prompter == nil {
+			prompter = policy.DenyPrompter{}
+		}
+		ok, perr := prompter.Confirm(name, args)
+		if perr != nil {
+			return i.recordDenied(node, rec, diag.CapPromptRequired,
+				"%s: confirmation failed: %s", name, perr.Error())
+		}
+		if !ok {
+			if _, deny := prompter.(policy.DenyPrompter); deny {
+				return i.recordDenied(node, rec, diag.CapPromptRequired,
+					"%s: policy requires confirmation; no prompter configured", name)
+			}
+			return i.recordDenied(node, rec, diag.CapPromptRequired,
+				"%s: confirmation declined", name)
+		}
+	}
+	return nil
+}
+
+// recordError logs a failed call (status "error") and returns the matching
+// CUE_TOOL_* error at the call site.
+func (i *Interp) recordError(node ast.Node, rec effectlog.Record, msg string) object.Object {
+	rec.Status = "error"
+	rec.Error = &msg
+	i.Effects.Append(rec)
+	return newError(node, diag.ToolFailure, "%s", msg)
+}
+
+// recordOK logs a successful call (status "ok") with its result rendered to a
+// plain JSON value for the envelope and durable log.
+func (i *Interp) recordOK(rec effectlog.Record, result object.Object) {
+	rec.Status = "ok"
+	rec.Result = object.ToAny(result)
+	i.Effects.Append(rec)
 }
 
 // recordDenied logs a blocked call as a "denied" effect (so the attempt is
 // auditable) and returns the matching CUE_CAP_* error. The tool's Invoke is never
 // reached, which is the safe-by-construction guarantee (DESIGN.md §7, §9).
-func (i *Interp) recordDenied(node *ast.CallExpression, rec effectlog.Record, code, format string, args ...any) object.Object {
+func (i *Interp) recordDenied(node ast.Node, rec effectlog.Record, code, format string, args ...any) object.Object {
 	msg := fmt.Sprintf(format, args...)
 	rec.Status = "denied"
 	rec.Error = &msg
