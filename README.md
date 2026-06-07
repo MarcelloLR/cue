@@ -156,3 +156,37 @@ go vet ./... && gofmt -l .    # lint + format check
 | `runtime/sqlitelog` | the queryable SQLite effect-log backend                 |
 | `repl`              | interactive read-eval-print loop                        |
 | `cmd/cue`           | the `cue` CLI                                            |
+
+## Current limitations
+
+Cue is a learning project scoped to tool orchestration, and is deliberately small.
+Known gaps — several are intentional deferred decisions (see DESIGN.md §14):
+
+- **Dynamically typed, no annotations.** There are no static or gradual types;
+  type mismatches surface at runtime. `cue check` is a conservative static pass
+  (unbound names, unknown tools/members, call arity) — not a general type checker.
+- **`llm()` is a deterministic mock by default.** It returns a stable transform of
+  the prompt so runs are reproducible offline; a real provider satisfies the same
+  `llm.Provider` interface, but none ships.
+- **No string interpolation.** Build strings with `+`; escapes (`\n`, `\"`) work,
+  but `"${x}"`-style interpolation does not.
+- **No `break` / `continue`.** Iterate with `for x in …` (which itself evaluates to
+  `null`) or `parallel`, and gather results with builtins (`push`) or recursion.
+- **No modules / `import`.** A program is a single file; there is no user-defined
+  import system. Comments are `//` line comments only (no `/* … */`).
+- **Small built-in tool surface.** `http.get`, `strings.upper`, and `fs.read` /
+  `fs.write` / `fs.delete`. The registry is the extension point, but the shipped
+  catalog is intentionally minimal.
+- **Shallow `llm` schema validation.** Structured output is validated one level
+  deep (key → `STRING` / `INTEGER` / `FLOAT` / `BOOLEAN`); nested objects and
+  arrays are not checked.
+- **`parallel` is fail-fast.** The first error cancels the rest (errgroup
+  semantics); there is no settle-all variant that collects `{ok|err}` per item.
+- **Rollback restores by inverse action, not snapshot.** A compensation undoes a
+  call by running its declared inverse (e.g. `fs.write` → `fs.delete`); it does not
+  capture and restore prior state, so rolling back an overwrite deletes the file
+  rather than restoring its previous contents.
+- **Whole-program runs.** Execution is batch (`cue run`); the REPL keeps state
+  within a session, but there is no persistent cross-invocation agent session.
+- **Tree-walking interpreter.** No bytecode or JIT — appropriate for IO-bound
+  orchestration, not for compute-heavy work.
