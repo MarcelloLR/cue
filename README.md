@@ -29,6 +29,83 @@ The full DESIGN.md v1 bar is implemented, plus the stretch goals:
 - **Stretch** — deterministic replay (`cue replay`), rollback via compensations
   (`cue rollback`), the `parallel` block form, and a queryable SQLite log backend.
 
+## A worked example
+
+A small program an agent might emit to triage a batch of bug reports —
+summarizing them concurrently, then escalating to a human if there are too many.
+`parallel`, `llm`, and `ask_human` are first-class ([`examples/triage.cue`](examples/triage.cue)):
+
+```cue
+// Summarize a batch of bug reports concurrently, then escalate to a human
+// if there are too many to auto-file.
+let issues = ["login button does nothing", "dashboard loads slowly", "typo in footer"]
+
+let summaries = parallel (issue in issues) {
+    llm("one-line summary: " + issue)
+}
+
+let decision = if len(summaries) > 2 {
+    ask_human("3+ issues found — auto-file tickets? (yes/no)")
+} else {
+    "auto"
+}
+
+decision
+```
+
+Run it — `llm` uses a built-in deterministic mock by default, so this needs no
+network or API key:
+
+```sh
+go build -o cue ./cmd/cue
+echo "yes" | ./cue run examples/triage.cue
+# 3+ issues found — auto-file tickets? (yes/no) yes
+```
+
+### The machine-readable contract
+
+The point of Cue is that the runtime answers the agent in **data, not prose**.
+Add `--json` for the structured run-result envelope (DESIGN.md §9): the result
+plus an effect-log record for every tool / `llm` / `ask_human` call, each tagged
+with the concurrency branch it ran on.
+
+```sh
+echo "yes" | ./cue run examples/triage.cue --json
+```
+
+```jsonc
+{
+  "ok": true,
+  "result": "yes",
+  "effects": [
+    // each record also has seq, ts, callsite, occurrence, args, reversible, duration_ms
+    { "tool": "llm",       "branch": "parallel:0", "status": "ok", "result": "[mock] one-line summary: login button does nothing" },
+    { "tool": "llm",       "branch": "parallel:1", "status": "ok", "result": "[mock] one-line summary: dashboard loads slowly" },
+    { "tool": "llm",       "branch": "parallel:2", "status": "ok", "result": "[mock] one-line summary: typo in footer" },
+    { "tool": "ask_human", "branch": "root",       "status": "ok", "result": "yes" }
+  ],
+  "diagnostics": []
+}
+```
+
+### Pre-flight and self-repair
+
+Before running, an agent can statically check what it emitted with `cue check`
+(no execution). Misspell a tool and you get a stable code, a source span, and a
+did-you-mean hint it can act on:
+
+```sh
+$ echo 'let body = http.gt("https://example.com")' > broken.cue
+$ ./cue check broken.cue
+broken.cue:1:12: [CUE_NAME_003] unknown tool "http.gt" in namespace "http" (hint: did you mean "http.get"? run `cue catalog` for tools)
+```
+
+With `--json` that same diagnostic carries `code`, `span`, `snippet`, `hint`, and
+`data.did_you_mean` — everything needed to fix the program and re-check. The loop
+is: emit → `cue check --json` → repair → `cue run --json` → read effects.
+`cue catalog --json` dumps the available tools and grammar to seed the agent's
+prompt in the first place.
+
 ## Build & run
 
 ```sh
@@ -79,3 +156,37 @@ go vet ./... && gofmt -l .    # lint + format check
 | `runtime/sqlitelog` | the queryable SQLite effect-log backend                 |
 | `repl`              | interactive read-eval-print loop                        |
 | `cmd/cue`           | the `cue` CLI                                            |
+
+## Current limitations
+
+Cue is a learning project scoped to tool orchestration, and is deliberately small.
+Known gaps — several are intentional deferred decisions (see DESIGN.md §14):
+
+- **Dynamically typed, no annotations.** There are no static or gradual types;
+  type mismatches surface at runtime. `cue check` is a conservative static pass
+  (unbound names, unknown tools/members, call arity) — not a general type checker.
+- **`llm()` is a deterministic mock by default.** It returns a stable transform of
+  the prompt so runs are reproducible offline; a real provider satisfies the same
+  `llm.Provider` interface, but none ships.
+- **No string interpolation.** Build strings with `+`; escapes (`\n`, `\"`) work,
+  but `"${x}"`-style interpolation does not.
+- **No `break` / `continue`.** Iterate with `for x in …` (which itself evaluates to
+  `null`) or `parallel`, and gather results with builtins (`push`) or recursion.
+- **No modules / `import`.** A program is a single file; there is no user-defined
+  import system. Comments are `//` line comments only (no `/* … */`).
+- **Small built-in tool surface.** `http.get`, `strings.upper`, and `fs.read` /
+  `fs.write` / `fs.delete`. The registry is the extension point, but the shipped
+  catalog is intentionally minimal.
+- **Shallow `llm` schema validation.** Structured output is validated one level
+  deep (key → `STRING` / `INTEGER` / `FLOAT` / `BOOLEAN`); nested objects and
+  arrays are not checked.
+- **`parallel` is fail-fast.** The first error cancels the rest (errgroup
+  semantics); there is no settle-all variant that collects `{ok|err}` per item.
+- **Rollback restores by inverse action, not snapshot.** A compensation undoes a
+  call by running its declared inverse (e.g. `fs.write` → `fs.delete`); it does not
+  capture and restore prior state, so rolling back an overwrite deletes the file
+  rather than restoring its previous contents.
+- **Whole-program runs.** Execution is batch (`cue run`); the REPL keeps state
+  within a session, but there is no persistent cross-invocation agent session.
+- **Tree-walking interpreter.** No bytecode or JIT — appropriate for IO-bound
+  orchestration, not for compute-heavy work.
