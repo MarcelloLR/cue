@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/MarcelloLR/cue/ast"
 	"github.com/MarcelloLR/cue/lexer"
@@ -42,6 +43,25 @@ type denyAll struct{}
 
 func (denyAll) Check(string, []object.Object, object.Reversibility) policy.Decision {
 	return policy.Deny
+}
+
+// promptAll is a Policy that returns Prompt for everything, exercising the
+// Prompter seam.
+type promptAll struct{}
+
+func (promptAll) Check(string, []object.Object, object.Reversibility) policy.Decision {
+	return policy.Prompt
+}
+
+// compMock is a ToolImpl that also implements object.Compensator, so it captures
+// an inverse action on a successful call (DESIGN.md §7).
+type compMock struct {
+	mockTool
+	compTool string
+}
+
+func (c *compMock) Compensation(args []object.Object, result object.Object) (string, []object.Object, bool) {
+	return c.compTool, args, true
 }
 
 // runTool parses src, injects a namespace "tool" with member "echo" backed by
@@ -163,8 +183,146 @@ func TestToolDeniedByPolicy(t *testing.T) {
 	if m.invoked != 0 {
 		t.Errorf("denied tool should not be invoked")
 	}
-	if len(effects) != 0 {
-		t.Errorf("denied tool should not log an effect")
+	// Phase 3: the blocked attempt is still recorded (status "denied") so the
+	// boundary is auditable, but Invoke never ran (DESIGN.md §7).
+	if len(effects) != 1 {
+		t.Fatalf("denied tool should log exactly one audit effect, got %d", len(effects))
+	}
+	if effects[0].Status != "denied" {
+		t.Errorf("denied effect status = %q, want denied", effects[0].Status)
+	}
+	if effects[0].Result != nil {
+		t.Errorf("denied effect should carry no result")
+	}
+	if effects[0].Error == nil || *effects[0].Error == "" {
+		t.Errorf("denied effect should carry the policy reason")
+	}
+}
+
+func TestEffectRecordFullySpecified(t *testing.T) {
+	// Drive a successful tool call through a recorder with a pinned clock and
+	// assert every §7 field lands on the record.
+	fixed := time.Date(2026, 6, 7, 12, 0, 0, 0, time.UTC)
+	effects := effectlog.NewRecorder()
+	effects.Clock = func() time.Time { return fixed }
+
+	p := parser.New(lexer.New(`tool.echo("hi")`))
+	program := p.ParseProgram()
+	if p.HasErrors() {
+		t.Fatalf("parse error")
+	}
+	env := object.NewEnvironment()
+	env.Set("tool", &object.Namespace{
+		Name:    "tool",
+		Members: map[string]*object.Tool{"echo": {Impl: newMock()}},
+	})
+	New(WithEffects(effects)).Eval(program, env)
+
+	recs := effects.Records()
+	if len(recs) != 1 {
+		t.Fatalf("records = %d, want 1", len(recs))
+	}
+	rec := recs[0]
+	if rec.Ts != fixed.Format(time.RFC3339) {
+		t.Errorf("ts = %q, want pinned clock time", rec.Ts)
+	}
+	if rec.Tool != "tool.echo" || rec.Status != "ok" || rec.Branch != "root" {
+		t.Errorf("unexpected record header: %+v", rec)
+	}
+	if rec.Callsite == "" || rec.Result == nil {
+		t.Errorf("record missing callsite/result: %+v", rec)
+	}
+	if !rec.Reversible {
+		t.Errorf("echo is reversible; record should reflect it")
+	}
+}
+
+func TestPromptAllowedByPrompter(t *testing.T) {
+	m := newMock()
+	allow := policy.FuncPrompter(func(string, []object.Object) (bool, error) { return true, nil })
+	result, effects := runTool(t, `tool.echo("hi")`, m,
+		WithPolicy(promptAll{}), WithPrompter(allow))
+
+	if _, ok := result.(*object.Hash); !ok {
+		t.Fatalf("an allow-prompter should let the call proceed, got %T (%s)", result, result.Inspect())
+	}
+	if m.invoked != 1 {
+		t.Errorf("confirmed tool should be invoked once, got %d", m.invoked)
+	}
+	if len(effects) != 1 || effects[0].Status != "ok" {
+		t.Fatalf("confirmed call should log one ok effect, got %+v", effects)
+	}
+}
+
+func TestPromptDeniedByDefaultPrompter(t *testing.T) {
+	m := newMock()
+	// No WithPrompter → the New() default policy.DenyPrompter conservatively denies.
+	result, effects := runTool(t, `tool.echo("hi")`, m, WithPolicy(promptAll{}))
+
+	e, ok := result.(*object.Error)
+	if !ok {
+		t.Fatalf("default prompter should deny, got %T (%s)", result, result.Inspect())
+	}
+	if e.Code != "CUE_CAP_002" {
+		t.Errorf("code = %q, want CUE_CAP_002", e.Code)
+	}
+	if m.invoked != 0 {
+		t.Errorf("an unconfirmed tool must not be invoked")
+	}
+	if len(effects) != 1 || effects[0].Status != "denied" {
+		t.Fatalf("unconfirmed call should log one denied effect, got %+v", effects)
+	}
+}
+
+func TestPromptDeclinedByPrompter(t *testing.T) {
+	m := newMock()
+	deny := policy.FuncPrompter(func(string, []object.Object) (bool, error) { return false, nil })
+	result, _ := runTool(t, `tool.echo("hi")`, m, WithPolicy(promptAll{}), WithPrompter(deny))
+	e, ok := result.(*object.Error)
+	if !ok {
+		t.Fatalf("a declining prompter should deny, got %T", result)
+	}
+	if e.Code != "CUE_CAP_002" {
+		t.Errorf("code = %q, want CUE_CAP_002", e.Code)
+	}
+	if m.invoked != 0 {
+		t.Errorf("a declined tool must not be invoked")
+	}
+}
+
+func TestCompensationCaptured(t *testing.T) {
+	c := &compMock{
+		mockTool: mockTool{
+			name: "tool.echo",
+			sig:  object.Signature{Params: []object.Param{{Name: "s", Type: "string"}}},
+			rev:  object.Reversible,
+		},
+		compTool: "tool.undo",
+	}
+	_, effects := runTool(t, `tool.echo("hi")`, c)
+	if len(effects) != 1 {
+		t.Fatalf("effects = %d, want 1", len(effects))
+	}
+	comp := effects[0].Compensation
+	if comp == nil {
+		t.Fatalf("a Compensator's successful call should capture a compensation descriptor")
+	}
+	if comp.Tool != "tool.undo" {
+		t.Errorf("compensation tool = %q, want tool.undo", comp.Tool)
+	}
+	if len(comp.Args) != 1 || comp.Args[0] != "hi" {
+		t.Errorf("compensation args = %v, want [hi]", comp.Args)
+	}
+}
+
+func TestNoCompensationForPlainTool(t *testing.T) {
+	// A tool that does not implement Compensator records no compensation.
+	_, effects := runTool(t, `tool.echo("hi")`, newMock())
+	if len(effects) != 1 {
+		t.Fatalf("effects = %d, want 1", len(effects))
+	}
+	if effects[0].Compensation != nil {
+		t.Errorf("plain tool should capture no compensation, got %+v", effects[0].Compensation)
 	}
 }
 

@@ -210,6 +210,18 @@ type ToolImpl interface {
 	Invoke(ctx context.Context, args []Object) (Object, error)
 }
 
+// Compensator is an optional interface a ToolImpl may implement to describe the
+// inverse action that undoes a successful call (DESIGN.md §4, §7). The invocation
+// pipeline captures the returned descriptor into the effect log's compensation
+// field after a successful call; rollback (firing it) is a later phase. Keeping
+// it optional means most tools — pure transforms, reads — declare nothing, and
+// only effectful tools that can be undone opt in.
+type Compensator interface {
+	// Compensation returns the inverse action (tool name + args) to undo a
+	// successful call given its args and result, or ok=false if none applies.
+	Compensation(args []Object, result Object) (tool string, compArgs []Object, ok bool)
+}
+
 // Tool is a callable runtime value wrapping a registered ToolImpl. Applying it
 // runs the invocation pipeline (policy check → effect log → Invoke).
 type Tool struct{ Impl ToolImpl }

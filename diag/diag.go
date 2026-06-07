@@ -46,7 +46,8 @@ const (
 	TypeBadKey       = "CUE_TYPE_006"
 
 	// Capability / policy gating.
-	CapDenied = "CUE_CAP_001"
+	CapDenied         = "CUE_CAP_001" // policy denied the call outright
+	CapPromptRequired = "CUE_CAP_002" // policy requires confirmation; prompter declined or absent
 
 	// Tool invocation failures (the tool's Invoke returned a Go error).
 	ToolFailure = "CUE_TOOL_001"

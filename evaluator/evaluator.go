@@ -55,6 +55,10 @@ type Interp struct {
 	Ctx context.Context
 	// Policy gates every tool call before it runs (DESIGN.md §7).
 	Policy policy.Policy
+	// Prompter resolves a policy Prompt decision into allow/deny at call time
+	// (DESIGN.md §7). It defaults to policy.DenyPrompter (a Prompt with no prompter
+	// is conservatively denied); Phase 4's ask_human becomes the interactive one.
+	Prompter policy.Prompter
 	// Effects records every gated tool call for the run envelope (§7, §9). Parallel
 	// branches share one Recorder (it is goroutine-safe), so the whole run stays in
 	// one ledger; each record is tagged with the branch it ran on.
@@ -79,6 +83,10 @@ func WithContext(ctx context.Context) Option { return func(i *Interp) { i.Ctx = 
 // WithPolicy sets the capability policy used to gate tool calls.
 func WithPolicy(p policy.Policy) Option { return func(i *Interp) { i.Policy = p } }
 
+// WithPrompter sets the prompter that resolves a policy Prompt decision. Defaults
+// to policy.DenyPrompter (Prompt without a prompter is denied).
+func WithPrompter(p policy.Prompter) Option { return func(i *Interp) { i.Prompter = p } }
+
 // WithEffects sets the effect recorder. Defaults to a fresh recorder.
 func WithEffects(r *effectlog.Recorder) Option { return func(i *Interp) { i.Effects = r } }
 
@@ -93,11 +101,12 @@ func WithOutput(w io.Writer) Option { return func(i *Interp) { i.Out = w } }
 // override these.
 func New(opts ...Option) *Interp {
 	i := &Interp{
-		Ctx:     context.Background(),
-		Policy:  policy.AllowAll{},
-		Effects: effectlog.NewRecorder(),
-		Branch:  "root",
-		Out:     os.Stdout,
+		Ctx:      context.Background(),
+		Policy:   policy.AllowAll{},
+		Prompter: policy.DenyPrompter{},
+		Effects:  effectlog.NewRecorder(),
+		Branch:   "root",
+		Out:      os.Stdout,
 	}
 	for _, opt := range opts {
 		opt(i)
@@ -584,11 +593,12 @@ func (i *Interp) evalParallelExpression(node *ast.ParallelExpression, env *objec
 			branchEnv.Set(node.Var.Value, item)
 
 			child := &Interp{
-				Ctx:     gctx,
-				Policy:  i.Policy,
-				Effects: i.Effects,
-				Branch:  i.branchLabel(k),
-				Out:     i.Out,
+				Ctx:      gctx,
+				Policy:   i.Policy,
+				Prompter: i.Prompter,
+				Effects:  i.Effects,
+				Branch:   i.branchLabel(k),
+				Out:      i.Out,
 			}
 
 			result := child.Eval(node.Body, branchEnv)
@@ -733,8 +743,13 @@ func (i *Interp) applyFunction(node *ast.CallExpression, fn object.Object, args 
 
 // invokeTool runs the tool invocation pipeline (DESIGN.md §7): arity check →
 // policy gate → effect-log the call → Invoke (with the run context) → log the
-// result/error → return the value. Effects are recorded into i.Effects keyed by a
-// deterministic call-site so the run stays reconstructable.
+// result/error/compensation → return the value. Effects are recorded into
+// i.Effects keyed by a deterministic call-site so the run stays reconstructable.
+//
+// The safety guarantee is structural: a Deny (and a Prompt the prompter declines)
+// returns a CUE_CAP_* error *before* Invoke is ever called — the tool does not
+// run — yet the blocked attempt is still recorded with status "denied" so the
+// boundary is auditable as well as learnable.
 func (i *Interp) invokeTool(node *ast.CallExpression, tool *object.Tool, args []object.Object) object.Object {
 	impl := tool.Impl
 	sig := impl.Signature()
@@ -745,25 +760,45 @@ func (i *Interp) invokeTool(node *ast.CallExpression, tool *object.Tool, args []
 			"%s: wrong number of arguments: want %d, got %d", impl.Name(), len(sig.Params), len(args))
 	}
 
-	// Policy gate. Deny is a learnable boundary (CUE_CAP_*). Prompt is treated as
-	// Allow in Phase 1 — the ask_human machinery arrives in Phase 4.
-	switch i.Policy.Check(impl.Name(), args, impl.Reversibility()) {
-	case policy.Deny:
-		return newError(node, diag.CapDenied,
-			"%s: denied by policy", impl.Name())
-	case policy.Prompt:
-		// TODO(phase 4): route Prompt through ask_human under the prompt lock.
-	}
+	rev := impl.Reversibility()
 
-	// Record the call and measure it. The callsite is the deterministic key the
-	// effect log (and, later, replay) uses instead of the scheduling-dependent
-	// global sequence number.
+	// The base record shared by every outcome (allow/deny/error/ok). Filled in
+	// per outcome below. The callsite is the deterministic key the effect log
+	// (and, later, replay) uses instead of the scheduling-dependent Seq.
 	rec := effectlog.Record{
 		Callsite:   callsite(node),
 		Branch:     i.Branch,
 		Tool:       impl.Name(),
 		Args:       renderArgs(args),
-		Reversible: impl.Reversibility() == object.Reversible,
+		Reversible: rev == object.Reversible,
+	}
+
+	// Policy gate. Deny is a learnable boundary (CUE_CAP_001); Prompt routes
+	// through the Prompter seam (CUE_CAP_002 when it declines or is absent). A
+	// blocked call is recorded with status "denied" and NOT invoked.
+	switch i.Policy.Check(impl.Name(), args, rev) {
+	case policy.Deny:
+		return i.recordDenied(node, rec, diag.CapDenied,
+			"%s: denied by policy", impl.Name())
+	case policy.Prompt:
+		prompter := i.Prompter
+		if prompter == nil {
+			prompter = policy.DenyPrompter{}
+		}
+		ok, perr := prompter.Confirm(impl.Name(), args)
+		if perr != nil {
+			return i.recordDenied(node, rec, diag.CapPromptRequired,
+				"%s: confirmation failed: %s", impl.Name(), perr.Error())
+		}
+		if !ok {
+			if _, deny := prompter.(policy.DenyPrompter); deny {
+				return i.recordDenied(node, rec, diag.CapPromptRequired,
+					"%s: policy requires confirmation; no prompter configured", impl.Name())
+			}
+			return i.recordDenied(node, rec, diag.CapPromptRequired,
+				"%s: confirmation declined", impl.Name())
+		}
+		// Confirmed: fall through to Invoke.
 	}
 
 	start := time.Now()
@@ -783,8 +818,26 @@ func (i *Interp) invokeTool(node *ast.CallExpression, tool *object.Tool, args []
 	}
 	rec.Status = "ok"
 	rec.Result = object.ToAny(result)
+	// Capture the inverse action for a successful reversible call so a later phase
+	// can roll it back (DESIGN.md §7). Capture only; firing is Phase 5.
+	if comp, ok := impl.(object.Compensator); ok {
+		if cTool, cArgs, ok := comp.Compensation(args, result); ok {
+			rec.Compensation = &effectlog.Compensation{Tool: cTool, Args: renderArgs(cArgs)}
+		}
+	}
 	i.Effects.Append(rec)
 	return result
+}
+
+// recordDenied logs a blocked call as a "denied" effect (so the attempt is
+// auditable) and returns the matching CUE_CAP_* error. The tool's Invoke is never
+// reached, which is the safe-by-construction guarantee (DESIGN.md §7, §9).
+func (i *Interp) recordDenied(node *ast.CallExpression, rec effectlog.Record, code, format string, args ...any) object.Object {
+	msg := fmt.Sprintf(format, args...)
+	rec.Status = "denied"
+	rec.Error = &msg
+	i.Effects.Append(rec)
+	return &object.Error{Code: code, Message: msg, Span: node.Span()}
 }
 
 // callsite derives a deterministic key from a call node's start position. It is

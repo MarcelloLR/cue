@@ -1,6 +1,8 @@
 // Command cue is the Cue interpreter CLI (DESIGN.md §11).
 //
-//	cue run <file.cue> [--json]     parse and execute a program
+//	cue run <file.cue> [--json] [--log <path>] [--policy <path>]
+//	                                parse and execute a program; --log streams the
+//	                                effect log as JSONL, --policy gates tool calls
 //	cue check <file.cue> [--json]   static checks only, no execution
 //	cue catalog [--json]            available tools + grammar (the agent prompt)
 //	cue <file.cue>                  shorthand for `cue run`
@@ -28,6 +30,7 @@ import (
 	"github.com/MarcelloLR/cue/repl"
 	"github.com/MarcelloLR/cue/runtime/effectlog"
 	"github.com/MarcelloLR/cue/runtime/envelope"
+	"github.com/MarcelloLR/cue/runtime/policy"
 	"github.com/MarcelloLR/cue/runtime/registry"
 	"github.com/MarcelloLR/cue/runtime/tools"
 )
@@ -74,12 +77,47 @@ func popFlag(args []string, name string) (rest []string, present bool) {
 	return rest, present
 }
 
+// popValueFlag pulls a value-taking flag (--name <value> or --name=<value>) out
+// of args, returning the remaining positional args, the value, and whether the
+// flag was present. A trailing --name with no value sets present=true and value=""
+// (the caller reports the usage error). It is the value-flag companion to popFlag.
+func popValueFlag(args []string, name string) (rest []string, value string, present bool) {
+	for idx := 0; idx < len(args); idx++ {
+		a := args[idx]
+		switch {
+		case a == name:
+			present = true
+			if idx+1 < len(args) {
+				value = args[idx+1]
+				idx++
+			}
+		case strings.HasPrefix(a, name+"="):
+			present = true
+			value = strings.TrimPrefix(a, name+"=")
+		default:
+			rest = append(rest, a)
+		}
+	}
+	return rest, value, present
+}
+
 // cmdRun parses and executes a program file, optionally emitting the JSON
-// envelope.
+// envelope, streaming the effect log to a JSONL file, and gating tool calls
+// through a policy config (DESIGN.md §7, §11).
 func cmdRun(args []string) int {
-	pos, asJSON := popFlag(args, "--json")
+	args, asJSON := popFlag(args, "--json")
+	args, logPath, hasLog := popValueFlag(args, "--log")
+	pos, policyPath, hasPolicy := popValueFlag(args, "--policy")
 	if len(pos) < 1 {
-		fmt.Fprintln(os.Stderr, "usage: cue run <file.cue> [--json]")
+		fmt.Fprintln(os.Stderr, "usage: cue run <file.cue> [--json] [--log <path>] [--policy <path>]")
+		return 2
+	}
+	if hasLog && logPath == "" {
+		fmt.Fprintln(os.Stderr, "cue: --log requires a path")
+		return 2
+	}
+	if hasPolicy && policyPath == "" {
+		fmt.Fprintln(os.Stderr, "cue: --policy requires a path")
 		return 2
 	}
 	path := pos[0]
@@ -89,6 +127,18 @@ func cmdRun(args []string) int {
 		return 1
 	}
 	source := string(src)
+
+	// Load the policy before any work: a malformed --policy is a setup error, and
+	// silently allowing every call would defeat the gate. Default stays allow-all.
+	var pol policy.Policy = policy.AllowAll{}
+	if hasPolicy {
+		cfg, err := policy.Load(policyPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			return 2
+		}
+		pol = cfg
+	}
 
 	p := parser.New(lexer.New(source))
 	program := p.ParseProgram()
@@ -109,9 +159,22 @@ func cmdRun(args []string) int {
 	injectNamespaces(env, reg)
 
 	effects := effectlog.NewRecorder()
+	// --log opens (creating, append-only) the durable JSONL sink and wires it so
+	// each record streams to disk as it is recorded (DESIGN.md §7).
+	if hasLog {
+		logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "cue: --log: %v\n", err)
+			return 1
+		}
+		defer logFile.Close()
+		effects.SetSink(logFile)
+	}
+
 	opts := []evaluator.Option{
 		evaluator.WithContext(context.Background()),
 		evaluator.WithEffects(effects),
+		evaluator.WithPolicy(pol),
 	}
 	// In --json mode stdout is reserved for the envelope, so route program output
 	// (print) to stderr; otherwise it would corrupt the machine-readable JSON.
