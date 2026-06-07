@@ -16,6 +16,9 @@ package evaluator
 import (
 	"context"
 	"fmt"
+	"io"
+	"os"
+	"sync"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -61,6 +64,10 @@ type Interp struct {
 	// stamped onto every effect record so concurrent runs stay reconstructable and,
 	// later, replayable (DESIGN.md §6, §10).
 	Branch string
+	// Out is where `print` writes. It defaults to os.Stdout, but in --json mode the
+	// CLI points it at stderr so stdout carries only the machine-readable envelope:
+	// the run output must stay parseable by the agent (DESIGN.md §9).
+	Out io.Writer
 }
 
 // Option configures an Interp at construction.
@@ -78,6 +85,9 @@ func WithEffects(r *effectlog.Recorder) Option { return func(i *Interp) { i.Effe
 // WithBranch sets the concurrency-path label stamped onto effect records.
 func WithBranch(branch string) Option { return func(i *Interp) { i.Branch = branch } }
 
+// WithOutput sets the writer `print` writes to. Defaults to os.Stdout.
+func WithOutput(w io.Writer) Option { return func(i *Interp) { i.Out = w } }
+
 // New returns an Interp with sensible defaults: a background context, the
 // allow-all policy, a fresh effect recorder, and the "root" branch. Options
 // override these.
@@ -87,11 +97,31 @@ func New(opts ...Option) *Interp {
 		Policy:  policy.AllowAll{},
 		Effects: effectlog.NewRecorder(),
 		Branch:  "root",
+		Out:     os.Stdout,
 	}
 	for _, opt := range opts {
 		opt(i)
 	}
+	// Serialize writes to Out: `parallel` branches share one Interp output, and a
+	// caller-supplied writer (e.g. a bytes.Buffer in a harness) is not necessarily
+	// goroutine-safe. Sibling Interps copy this same *syncWriter by reference, so
+	// concurrent prints never interleave mid-line or race (DESIGN.md §6).
+	if _, already := i.Out.(*syncWriter); !already {
+		i.Out = &syncWriter{w: i.Out}
+	}
 	return i
+}
+
+// syncWriter serializes concurrent writes to an underlying writer with a mutex.
+type syncWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (s *syncWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
 }
 
 // Eval evaluates a node in env using a default Interp. It preserves the Phase 0
@@ -156,7 +186,7 @@ func (i *Interp) Eval(node ast.Node, env *object.Environment) object.Object {
 
 	// Expressions.
 	case *ast.Identifier:
-		return evalIdentifier(node, env)
+		return i.evalIdentifier(node, env)
 	case *ast.PrefixExpression:
 		right := i.Eval(node.Right, env)
 		if isError(right) {
@@ -283,9 +313,14 @@ func evalIndexAssign(node ast.Node, left, index, val object.Object) object.Objec
 	return newError(node, diag.TypeNotIndexable, "cannot index-assign into %s", left.Type())
 }
 
-func evalIdentifier(node *ast.Identifier, env *object.Environment) object.Object {
+func (i *Interp) evalIdentifier(node *ast.Identifier, env *object.Environment) object.Object {
 	if val, ok := env.Get(node.Value); ok {
 		return val
+	}
+	// `print` is the one builtin whose behaviour depends on run state (where its
+	// output goes), so it is built per-Interp rather than living in the shared map.
+	if node.Value == "print" {
+		return i.printBuiltin()
 	}
 	if b, ok := builtins[node.Value]; ok {
 		return b
@@ -553,6 +588,7 @@ func (i *Interp) evalParallelExpression(node *ast.ParallelExpression, env *objec
 				Policy:  i.Policy,
 				Effects: i.Effects,
 				Branch:  i.branchLabel(k),
+				Out:     i.Out,
 			}
 
 			result := child.Eval(node.Body, branchEnv)
