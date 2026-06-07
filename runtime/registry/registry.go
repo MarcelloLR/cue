@@ -109,7 +109,8 @@ type Catalog struct {
 const grammarSummary = "let x = expr | x = expr | fn(a, b) { ... } | " +
 	"if cond { ... } else { ... } | for x in xs { ... } | " +
 	"parallel (x in xs[, limit = n]) { ... } | " +
-	"ns.tool(args) | [a, b] | {\"k\": v} | a.b | a[i] | // comment"
+	"retry (n) { ... } | ns.tool(args) | llm(prompt[, opts]) | " +
+	"ask_human(prompt) | [a, b] | {\"k\": v} | a.b | a[i] | // comment"
 
 // Catalog produces the serializable catalog for `cue catalog`, sorted by tool
 // name for deterministic output.

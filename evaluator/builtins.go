@@ -2,10 +2,14 @@ package evaluator
 
 import (
 	"fmt"
+	"sort"
 	"strings"
+	"time"
 
+	"github.com/MarcelloLR/cue/ast"
 	"github.com/MarcelloLR/cue/diag"
 	"github.com/MarcelloLR/cue/object"
+	"github.com/MarcelloLR/cue/runtime/llm"
 )
 
 // builtins are the native, un-gated functions always in scope. Outside-world
@@ -30,16 +34,18 @@ var builtins = map[string]*object.Builtin{
 // variadic (no static arity check). The static checker (package check) reads this
 // so the builtin surface is described in exactly one place.
 var builtinArities = map[string]int{
-	"len":   1,
-	"print": -1, // variadic
-	"type":  1,
-	"str":   1,
-	"first": 1,
-	"last":  1,
-	"rest":  1,
-	"push":  2,
-	"keys":  1,
-	"range": 1,
+	"len":       1,
+	"print":     -1, // variadic
+	"type":      1,
+	"str":       1,
+	"first":     1,
+	"last":      1,
+	"rest":      1,
+	"push":      2,
+	"keys":      1,
+	"range":     1,
+	"ask_human": 1,
+	"llm":       -1, // llm(prompt) or llm(prompt, opts)
 }
 
 // BuiltinArities returns a copy of the builtin name→arity table (arity -1 means
@@ -92,6 +98,169 @@ func (i *Interp) printBuiltin() *object.Builtin {
 		fmt.Fprintln(i.Out, strings.Join(parts, " "))
 		return NULL
 	}}
+}
+
+// askHumanBuiltin builds the per-Interp `ask_human(prompt)` primitive (DESIGN.md
+// §8). It writes the prompt to Out, reads ONE line from In under the global prompt
+// lock (so concurrent `parallel` branches never interleave on stdin, §6), records
+// the human's answer as an effect — recording the input is what makes a run
+// replayable — and returns the line as a String. It is logged but NOT policy-gated:
+// ask_human is itself the escalation target of a policy Prompt, not a tool to gate.
+func (i *Interp) askHumanBuiltin(node ast.Node) *object.Builtin {
+	return &object.Builtin{Name: "ask_human", Fn: func(args ...object.Object) object.Object {
+		if len(args) != 1 {
+			return newError(node, diag.TypeArgCount,
+				"ask_human: wrong number of arguments: want 1, got %d", len(args))
+		}
+		prompt, ok := args[0].(*object.String)
+		if !ok {
+			return newError(node, diag.TypeMismatch,
+				"ask_human: prompt must be STRING, got %s", args[0].Type())
+		}
+		rec := i.newRecord(node, "ask_human", args, false)
+		line, err := i.promptLine(prompt.Value + " ")
+		if err != nil {
+			return i.recordError(node, rec, "ask_human: "+err.Error())
+		}
+		answer := &object.String{Value: line}
+		i.recordOK(rec, answer)
+		return answer
+	}}
+}
+
+// llmBuiltin builds the per-Interp `llm(prompt, [opts])` primitive (DESIGN.md §8).
+// It is a gated, logged tool like any other (a Deny on "llm" yields CUE_CAP_* and
+// the provider is never called), routed through the same policy/effect pipeline as
+// tools. Called as `llm(prompt)` it returns a String; called as `llm(prompt, opts)`
+// where opts carries a `schema` (a key→type-name Hash) it returns a Hash validated
+// against that shape, with a CUE_TYPE_* error on a missing key or type mismatch (§9).
+// The provider is pluggable; the default is an offline deterministic mock.
+func (i *Interp) llmBuiltin(node ast.Node) *object.Builtin {
+	return &object.Builtin{Name: "llm", Fn: func(args ...object.Object) object.Object {
+		if len(args) < 1 || len(args) > 2 {
+			return newError(node, diag.TypeArgCount,
+				"llm: wrong number of arguments: want 1 or 2, got %d", len(args))
+		}
+		prompt, ok := args[0].(*object.String)
+		if !ok {
+			return newError(node, diag.TypeMismatch,
+				"llm: prompt must be STRING, got %s", args[0].Type())
+		}
+		schema, serr := llmSchema(node, args)
+		if serr != nil {
+			return serr
+		}
+
+		rec := i.newRecord(node, "llm", args, true)
+		if denied := i.gate(node, rec, "llm", args, object.Reversible); denied != nil {
+			return denied
+		}
+
+		start := time.Now()
+		res, err := i.LLM.Complete(i.Ctx, llm.Request{Prompt: prompt.Value, Schema: schema})
+		rec.DurationMs = time.Since(start).Milliseconds()
+		if err != nil {
+			return i.recordError(node, rec, "llm: "+err.Error())
+		}
+
+		out, verr := llmResult(node, schema, res)
+		if verr != nil {
+			// A schema mismatch is a type error, not a tool failure; record the
+			// blocked outcome for audit and surface CUE_TYPE_* to the program.
+			msg := verr.Message
+			rec.Status = "error"
+			rec.Error = &msg
+			i.Effects.Append(rec)
+			return verr
+		}
+		i.recordOK(rec, out)
+		return out
+	}}
+}
+
+// llmSchema extracts the optional structured-output schema from an llm call's
+// second argument (an opts Hash with a `schema` Hash mapping key → Cue type name).
+// It returns (nil, nil) when no schema is requested, or a CUE_TYPE_* error if the
+// options/schema are the wrong shape.
+func llmSchema(node ast.Node, args []object.Object) (map[string]string, *object.Error) {
+	if len(args) < 2 {
+		return nil, nil
+	}
+	opts, ok := args[1].(*object.Hash)
+	if !ok {
+		return nil, newError(node, diag.TypeMismatch, "llm: options must be HASH, got %s", args[1].Type())
+	}
+	sv, ok := opts.Pairs["schema"]
+	if !ok {
+		return nil, nil
+	}
+	sh, ok := sv.(*object.Hash)
+	if !ok {
+		return nil, newError(node, diag.TypeMismatch, "llm: schema must be HASH, got %s", sv.Type())
+	}
+	schema := make(map[string]string, len(sh.Keys))
+	for _, k := range sh.Keys {
+		tn, ok := sh.Pairs[k].(*object.String)
+		if !ok {
+			return nil, newError(node, diag.TypeMismatch,
+				"llm: schema type for %q must be a STRING type-name, got %s", k, sh.Pairs[k].Type())
+		}
+		schema[k] = tn.Value
+	}
+	return schema, nil
+}
+
+// llmResult turns a provider Result into a Cue value. Without a schema it is the
+// free-form string; with one it is a Hash whose every schema key is present and
+// type-matches, else a CUE_TYPE_* error. Keys are emitted in sorted order so the
+// resulting Hash is deterministic regardless of provider map iteration.
+func llmResult(node ast.Node, schema map[string]string, res llm.Result) (object.Object, *object.Error) {
+	if schema == nil {
+		return &object.String{Value: res.Text}, nil
+	}
+	keys := make([]string, 0, len(schema))
+	for k := range schema {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	h := object.NewHash()
+	for _, key := range keys {
+		raw, ok := res.Object[key]
+		if !ok {
+			return nil, newError(node, diag.TypeMismatch, "llm: structured output missing key %q", key)
+		}
+		val := goToObject(raw)
+		want := object.ObjectType(strings.ToUpper(schema[key]))
+		if val.Type() != want {
+			return nil, newError(node, diag.TypeMismatch,
+				"llm: structured output key %q: want %s, got %s", key, want, val.Type())
+		}
+		h.Set(key, val)
+	}
+	return h, nil
+}
+
+// goToObject lifts a Go scalar from a provider Result into a Cue value. The llm
+// provider returns plain Go scalars (string/int64/float64/bool); anything else
+// falls back to its string form.
+func goToObject(v any) object.Object {
+	switch x := v.(type) {
+	case nil:
+		return NULL
+	case string:
+		return &object.String{Value: x}
+	case bool:
+		return nativeBool(x)
+	case int:
+		return &object.Integer{Value: int64(x)}
+	case int64:
+		return &object.Integer{Value: x}
+	case float64:
+		return &object.Float{Value: x}
+	default:
+		return &object.String{Value: fmt.Sprint(x)}
+	}
 }
 
 func builtinType(args ...object.Object) object.Object {

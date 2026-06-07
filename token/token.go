@@ -83,6 +83,7 @@ const (
 	FALSE    TokenType = "FALSE"
 	NULL     TokenType = "NULL"
 	PARALLEL TokenType = "PARALLEL"
+	RETRY    TokenType = "RETRY"
 )
 
 var keywords = map[string]TokenType{
@@ -97,6 +98,7 @@ var keywords = map[string]TokenType{
 	"false":    FALSE,
 	"null":     NULL,
 	"parallel": PARALLEL,
+	"retry":    RETRY,
 }
 
 // LookupIdent maps an identifier to its keyword type, or IDENT if it is not a

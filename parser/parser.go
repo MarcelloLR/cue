@@ -84,6 +84,7 @@ func New(l *lexer.Lexer) *Parser {
 		token.IF:       p.parseIfExpression,
 		token.FOR:      p.parseForExpression,
 		token.PARALLEL: p.parseParallelExpression,
+		token.RETRY:    p.parseRetryExpression,
 		token.FN:       p.parseFunctionLiteral,
 		token.LBRACKET: p.parseArrayLiteral,
 		token.LBRACE:   p.parseHashLiteral,
@@ -449,6 +450,30 @@ func (p *Parser) parseParallelExpression() ast.Expression {
 	pe.Body = p.parseBlockStatement()
 	pe.Sp = p.spanFrom(start)
 	return pe
+}
+
+// parseRetryExpression parses the retry form `retry ( EXPR ) BLOCK` (DESIGN.md
+// §3, §8), mirroring parseParallelExpression: the leading '(' opens the lexer's
+// paren-depth so newlines inside the head are line continuations, and the body is
+// an ordinary block. EXPR is the maximum attempt count, evaluated and validated
+// (positive integer) at runtime. Like `parallel`, retry is an expression.
+func (p *Parser) parseRetryExpression() ast.Expression {
+	start := p.cur
+	re := &ast.RetryExpression{Token: start}
+	if !p.expectPeek(token.LPAREN) {
+		return nil
+	}
+	p.nextToken()
+	re.Attempts = p.parseExpression(LOWEST)
+	if !p.expectPeek(token.RPAREN) {
+		return nil
+	}
+	if !p.expectPeek(token.LBRACE) {
+		return nil
+	}
+	re.Body = p.parseBlockStatement()
+	re.Sp = p.spanFrom(start)
+	return re
 }
 
 func (p *Parser) parseFunctionLiteral() ast.Expression {

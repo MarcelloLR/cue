@@ -143,6 +143,9 @@ func (c *checker) checkExpr(expr ast.Expression, sc *scope) {
 		inner := newScope(sc)
 		inner.define(e.Var.Value)
 		c.checkStatement(e.Body, inner)
+	case *ast.RetryExpression:
+		c.checkExpr(e.Attempts, sc)
+		c.checkStatement(e.Body, newScope(sc))
 	case *ast.FunctionLiteral:
 		inner := newScope(sc)
 		for _, p := range e.Parameters {

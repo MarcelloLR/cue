@@ -182,6 +182,9 @@ func cmdRun(args []string) int {
 		opts = append(opts, evaluator.WithOutput(os.Stderr))
 	}
 	interp := evaluator.New(opts...)
+	// A policy Prompt decision asks the operator via stdin (DESIGN.md §7): ask_human
+	// is the interactive prompter, sharing the run's prompt lock + input/output.
+	interp.Prompter = evaluator.NewInteractivePrompter(interp)
 	result := interp.Eval(program, env)
 
 	if asJSON {
