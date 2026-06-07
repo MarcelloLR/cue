@@ -313,6 +313,39 @@ func (fe *ForExpression) String() string {
 	return out.String()
 }
 
+// ParallelExpression is the parallel map form `parallel (<Var> in <Iterable>
+// [, limit = <Limit>]) <Body>` (DESIGN.md §3, §6). Like `for` it binds Var over
+// the elements of Iterable, but it evaluates Body for each element concurrently
+// and yields an Array of the results in input order. Limit is an optional inline
+// bound on concurrency; nil means the default limit applies. It is an expression
+// (it yields a value), like `if` and `fn`.
+type ParallelExpression struct {
+	spanned
+	Token    token.Token // the 'parallel' token
+	Var      *Identifier
+	Iterable Expression
+	Limit    Expression // optional `limit = <expr>`; nil ⇒ default limit
+	Body     *BlockStatement
+}
+
+func (pe *ParallelExpression) expressionNode()      {}
+func (pe *ParallelExpression) TokenLiteral() string { return pe.Token.Literal }
+func (pe *ParallelExpression) String() string {
+	var out strings.Builder
+	out.WriteString("parallel (")
+	out.WriteString(pe.Var.String())
+	out.WriteString(" in ")
+	out.WriteString(pe.Iterable.String())
+	if pe.Limit != nil {
+		out.WriteString(", limit = ")
+		out.WriteString(pe.Limit.String())
+	}
+	out.WriteString(") { ")
+	out.WriteString(pe.Body.String())
+	out.WriteString(" }")
+	return out.String()
+}
+
 // FunctionLiteral is `fn(<Parameters>) <Body>`.
 type FunctionLiteral struct {
 	spanned

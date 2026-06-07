@@ -11,9 +11,11 @@ import (
 // builtins are the native, un-gated functions always in scope. Outside-world
 // tools (http, llm, ask_human, …) are a separate, gated registry added in a
 // later phase; these are pure-ish language utilities.
+// builtins are stateless: their behaviour does not depend on the run. `print` is
+// the exception (its output target is run state), so it is constructed per-Interp
+// by printBuiltin and is deliberately absent here.
 var builtins = map[string]*object.Builtin{
 	"len":   {Name: "len", Fn: builtinLen},
-	"print": {Name: "print", Fn: builtinPrint},
 	"type":  {Name: "type", Fn: builtinType},
 	"str":   {Name: "str", Fn: builtinStr},
 	"first": {Name: "first", Fn: builtinFirst},
@@ -78,13 +80,18 @@ func builtinLen(args ...object.Object) object.Object {
 	return berr("len: unsupported type %s", args[0].Type())
 }
 
-func builtinPrint(args ...object.Object) object.Object {
-	parts := make([]string, 0, len(args))
-	for _, a := range args {
-		parts = append(parts, a.Inspect())
-	}
-	fmt.Println(strings.Join(parts, " "))
-	return NULL
+// printBuiltin builds the `print` builtin bound to this run's output writer.
+// In --json mode the CLI sets i.Out to stderr so program output never pollutes
+// the machine-readable envelope on stdout (DESIGN.md §9).
+func (i *Interp) printBuiltin() *object.Builtin {
+	return &object.Builtin{Name: "print", Fn: func(args ...object.Object) object.Object {
+		parts := make([]string, 0, len(args))
+		for _, a := range args {
+			parts = append(parts, a.Inspect())
+		}
+		fmt.Fprintln(i.Out, strings.Join(parts, " "))
+		return NULL
+	}}
 }
 
 func builtinType(args ...object.Object) object.Object {

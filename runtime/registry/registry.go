@@ -108,6 +108,7 @@ type Catalog struct {
 // grammarSummary is a compact reminder of Cue's surface for the agent prompt.
 const grammarSummary = "let x = expr | x = expr | fn(a, b) { ... } | " +
 	"if cond { ... } else { ... } | for x in xs { ... } | " +
+	"parallel (x in xs[, limit = n]) { ... } | " +
 	"ns.tool(args) | [a, b] | {\"k\": v} | a.b | a[i] | // comment"
 
 // Catalog produces the serializable catalog for `cue catalog`, sorted by tool

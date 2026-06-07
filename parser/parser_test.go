@@ -98,3 +98,53 @@ func TestDiagnosticsHaveSpans(t *testing.T) {
 		t.Error("diagnostic missing span")
 	}
 }
+
+func TestParallelParses(t *testing.T) {
+	cases := []struct {
+		input string
+		want  string
+	}{
+		{"parallel (i in xs) { i }", "parallel (i in xs) { i }"},
+		{"parallel (i in xs) { f(i) }", "parallel (i in xs) { f(i) }"},
+		// The leading '(' opens paren-depth, so a newline inside the head is a
+		// continuation (DESIGN.md §2).
+		{"parallel (i in\nxs) { i }", "parallel (i in xs) { i }"},
+		// Inline bounded limit.
+		{"parallel (i in xs, limit = 4) { i }", "parallel (i in xs, limit = 4) { i }"},
+		{"parallel (i in [1, 2, 3], limit = n) { i }", "parallel (i in [1, 2, 3], limit = n) { i }"},
+	}
+	for _, c := range cases {
+		if got := parse(t, c.input); got != c.want {
+			t.Errorf("parse(%q) = %q, want %q", c.input, got, c.want)
+		}
+	}
+}
+
+func TestParallelMalformedYieldsDiagnostic(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+	}{
+		{"missing open paren", "parallel i in xs { i }"},
+		{"missing in", "parallel (i xs) { i }"},
+		{"missing var", "parallel (in xs) { i }"},
+		{"missing close paren", "parallel (i in xs { i }"},
+		{"missing body", "parallel (i in xs)"},
+		{"limit keyword typo", "parallel (i in xs, limt = 4) { i }"},
+		{"limit missing equals", "parallel (i in xs, limit 4) { i }"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := New(lexer.New(c.src))
+			p.ParseProgram()
+			if !p.HasErrors() {
+				t.Fatalf("expected a diagnostic for %q", c.src)
+			}
+			for _, d := range p.Diagnostics() {
+				if d.Span.Start.Line == 0 {
+					t.Errorf("diagnostic %q missing span", d.Code)
+				}
+			}
+		})
+	}
+}

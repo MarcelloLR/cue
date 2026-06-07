@@ -83,6 +83,7 @@ func New(l *lexer.Lexer) *Parser {
 		token.LPAREN:   p.parseGroupedExpression,
 		token.IF:       p.parseIfExpression,
 		token.FOR:      p.parseForExpression,
+		token.PARALLEL: p.parseParallelExpression,
 		token.FN:       p.parseFunctionLiteral,
 		token.LBRACKET: p.parseArrayLiteral,
 		token.LBRACE:   p.parseHashLiteral,
@@ -399,6 +400,55 @@ func (p *Parser) parseForExpression() ast.Expression {
 	fe.Body = p.parseBlockStatement()
 	fe.Sp = p.spanFrom(start)
 	return fe
+}
+
+// parseParallelExpression parses the parallel map form
+// `parallel ( IDENT in EXPR [ , limit = EXPR ] ) BLOCK` (DESIGN.md §3, §6).
+// The leading '(' opens the lexer's paren-depth, so newlines inside the head are
+// line continuations. The optional `limit = EXPR` caps concurrency; absent, the
+// evaluator's default limit applies. The block form (`parallel BLOCK`) is
+// phase-later and is not parsed here.
+func (p *Parser) parseParallelExpression() ast.Expression {
+	start := p.cur
+	pe := &ast.ParallelExpression{Token: start}
+	if !p.expectPeek(token.LPAREN) {
+		return nil
+	}
+	if !p.expectPeek(token.IDENT) {
+		return nil
+	}
+	pe.Var = &ast.Identifier{Token: p.cur, Value: p.cur.Literal}
+	pe.Var.Sp = p.cur.Span
+	if !p.expectPeek(token.IN) {
+		return nil
+	}
+	p.nextToken()
+	pe.Iterable = p.parseExpression(LOWEST)
+
+	// Optional inline bound: `, limit = EXPR`.
+	if p.peek.Type == token.COMMA {
+		p.nextToken() // cur = ','
+		if !p.expectPeek(token.IDENT) || p.cur.Literal != "limit" {
+			p.diags.Error(diag.ParseUnexpectedToken, p.cur.Span,
+				"expected `limit`, found %q", p.cur.Literal)
+			return nil
+		}
+		if !p.expectPeek(token.ASSIGN) {
+			return nil
+		}
+		p.nextToken()
+		pe.Limit = p.parseExpression(LOWEST)
+	}
+
+	if !p.expectPeek(token.RPAREN) {
+		return nil
+	}
+	if !p.expectPeek(token.LBRACE) {
+		return nil
+	}
+	pe.Body = p.parseBlockStatement()
+	pe.Sp = p.spanFrom(start)
+	return pe
 }
 
 func (p *Parser) parseFunctionLiteral() ast.Expression {

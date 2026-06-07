@@ -109,10 +109,16 @@ func cmdRun(args []string) int {
 	injectNamespaces(env, reg)
 
 	effects := effectlog.NewRecorder()
-	interp := evaluator.New(
+	opts := []evaluator.Option{
 		evaluator.WithContext(context.Background()),
 		evaluator.WithEffects(effects),
-	)
+	}
+	// In --json mode stdout is reserved for the envelope, so route program output
+	// (print) to stderr; otherwise it would corrupt the machine-readable JSON.
+	if asJSON {
+		opts = append(opts, evaluator.WithOutput(os.Stderr))
+	}
+	interp := evaluator.New(opts...)
 	result := interp.Eval(program, env)
 
 	if asJSON {

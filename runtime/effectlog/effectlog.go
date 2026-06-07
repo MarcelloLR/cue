@@ -16,14 +16,20 @@ import "sync"
 // of the §7 schema: enough to audit and (later) replay a run, with room to grow.
 type Record struct {
 	// Seq is the global append order. It is scheduling-dependent under
-	// `parallel`; deterministic replay keys on (Branch, Callsite) instead (§10).
+	// `parallel`; deterministic replay keys on (Branch, Callsite, Occurrence)
+	// instead (§10).
 	Seq int `json:"seq"`
 	// Callsite is a deterministic key derived from the call node's span
 	// ("line:col"), stable across runs for the same source.
 	Callsite string `json:"callsite"`
-	// Branch is the concurrency path; "root" until Phase 2 introduces parallel
-	// branches ("parallel:2", …).
+	// Branch is the concurrency path; "root" at the top level, "parallel:k" (and
+	// nested "parallel:k/parallel:j") inside parallel branches (§6).
 	Branch string `json:"branch"`
+	// Occurrence is the per-(Branch, Callsite) repeat index, starting at 0. Unlike
+	// Seq it is scheduling-independent, so together with Branch and Callsite it
+	// forms the stable replay key (§10) — e.g. a tool called inside a `for` loop
+	// gets occurrences 0, 1, 2, … within its branch.
+	Occurrence int `json:"occurrence"`
 	// Tool is the full namespaced tool name, e.g. "http.get".
 	Tool string `json:"tool"`
 	// Args are the rendered call arguments (Inspect strings), kept JSON-friendly.
@@ -42,23 +48,35 @@ type Record struct {
 }
 
 // Recorder accumulates effect Records in invocation order. It is safe for
-// concurrent use so Phase 2's parallel branches can share one Recorder.
+// concurrent use so Phase 2's parallel branches can share one Recorder: every
+// mutation happens under mu, which is the single piece of shared mutable runtime
+// state the scheduler touches (DESIGN.md §6).
 type Recorder struct {
 	mu      sync.Mutex
 	records []Record
+	// occ counts prior appends per (branch, callsite) so each record's Occurrence
+	// is assigned deterministically regardless of goroutine scheduling (§10).
+	occ map[string]int
 }
 
 // NewRecorder returns an empty Recorder.
-func NewRecorder() *Recorder { return &Recorder{} }
+func NewRecorder() *Recorder { return &Recorder{occ: map[string]int{}} }
 
-// Append assigns the next sequence number, stores the record, and returns its
-// Seq. Branch defaults to "root" when unset.
+// Append assigns the scheduling-dependent Seq (global append order) and the
+// scheduling-independent Occurrence (per-(Branch, Callsite) repeat index), stores
+// the record, and returns its Seq. Branch defaults to "root" when unset.
 func (r *Recorder) Append(rec Record) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if rec.Branch == "" {
 		rec.Branch = "root"
 	}
+	if r.occ == nil {
+		r.occ = map[string]int{}
+	}
+	key := rec.Branch + "\x00" + rec.Callsite
+	rec.Occurrence = r.occ[key]
+	r.occ[key]++
 	rec.Seq = len(r.records)
 	r.records = append(r.records, rec)
 	return rec.Seq
