@@ -115,6 +115,43 @@ func (r *Recorder) SetSink(w io.Writer) {
 	r.sink = w
 }
 
+// occKey builds the per-(branch, callsite) counter key. Branch is normalised to
+// "root" when empty, matching the default applied on append, so the live recorder
+// and the replay lookup that share this counter agree on the key (DESIGN.md §10).
+func occKey(branch, callsite string) string {
+	if branch == "" {
+		branch = "root"
+	}
+	return branch + "\x00" + callsite
+}
+
+// nextOcc returns the next Occurrence for a (branch, callsite) and advances the
+// counter. It is the single source of truth for occurrence assignment: every
+// effect — whether appended by a live run or reserved by deterministic replay —
+// pulls its Occurrence from here exactly once, so the replay key cannot drift from
+// what a live run would have produced (DESIGN.md §10). It must be called under mu.
+func (r *Recorder) nextOcc(key string) int {
+	if r.occ == nil {
+		r.occ = map[string]int{}
+	}
+	occ := r.occ[key]
+	r.occ[key]++
+	return occ
+}
+
+// Reserve advances and returns the next Occurrence for (branch, callsite) without
+// storing a record. It is the seam deterministic replay uses to compute, in
+// lockstep with the live recorder, the (Branch, Callsite, Occurrence) key it looks
+// the recorded outcome up by — the occurrence MUST come from the same counter a
+// live Append would use, which is why both go through nextOcc (DESIGN.md §10). The
+// replay path follows a Reserve with AppendReserved so the counter advances exactly
+// once per effect. Branch defaults to "root" when unset.
+func (r *Recorder) Reserve(branch, callsite string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.nextOcc(occKey(branch, callsite))
+}
+
 // Append assigns the timestamp (from Clock), the scheduling-dependent Seq (global
 // append order) and the scheduling-independent Occurrence (per-(Branch, Callsite)
 // repeat index), stores the record, streams it to the sink if one is configured,
@@ -125,9 +162,29 @@ func (r *Recorder) Append(rec Record) int {
 	if rec.Branch == "" {
 		rec.Branch = "root"
 	}
-	if r.occ == nil {
-		r.occ = map[string]int{}
+	rec.Occurrence = r.nextOcc(occKey(rec.Branch, rec.Callsite))
+	return r.store(rec)
+}
+
+// AppendReserved stores a record whose Occurrence was already assigned by a prior
+// Reserve, leaving the occurrence counter untouched. Deterministic replay uses it
+// so a replayed effect still lands in the live ledger (and a fresh JSONL log) with
+// the same key it was looked up under, without double-counting the occurrence
+// (DESIGN.md §10). Branch defaults to "root" when unset.
+func (r *Recorder) AppendReserved(rec Record) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if rec.Branch == "" {
+		rec.Branch = "root"
 	}
+	return r.store(rec)
+}
+
+// store stamps the timestamp and global Seq, appends the record to the in-memory
+// slice, and streams it to the durable sink. It is the shared tail of Append and
+// AppendReserved and must be called under mu; it never touches the occurrence
+// counter — its callers own that decision (DESIGN.md §10).
+func (r *Recorder) store(rec Record) int {
 	clock := r.Clock
 	if clock == nil {
 		clock = time.Now
@@ -135,9 +192,6 @@ func (r *Recorder) Append(rec Record) int {
 	if rec.Ts == "" {
 		rec.Ts = clock().Format(time.RFC3339)
 	}
-	key := rec.Branch + "\x00" + rec.Callsite
-	rec.Occurrence = r.occ[key]
-	r.occ[key]++
 	rec.Seq = len(r.records)
 	r.records = append(r.records, rec)
 	r.writeSink(rec)

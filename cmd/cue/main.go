@@ -5,6 +5,10 @@
 //	                                effect log as JSONL, --policy gates tool calls
 //	cue check <file.cue> [--json]   static checks only, no execution
 //	cue catalog [--json]            available tools + grammar (the agent prompt)
+//	cue replay <log> <file.cue> [--json]
+//	                                deterministically replay a program against a
+//	                                prior effect log: effect-producing calls return
+//	                                their recorded outcomes instead of running
 //	cue <file.cue>                  shorthand for `cue run`
 //	cue repl                        start an interactive session
 //	cue                             start an interactive session
@@ -32,6 +36,7 @@ import (
 	"github.com/MarcelloLR/cue/runtime/envelope"
 	"github.com/MarcelloLR/cue/runtime/policy"
 	"github.com/MarcelloLR/cue/runtime/registry"
+	"github.com/MarcelloLR/cue/runtime/replay"
 	"github.com/MarcelloLR/cue/runtime/tools"
 )
 
@@ -48,10 +53,12 @@ func main() {
 		os.Exit(cmdCheck(args[1:]))
 	case args[0] == "catalog":
 		os.Exit(cmdCatalog(args[1:]))
+	case args[0] == "replay":
+		os.Exit(cmdReplay(args[1:]))
 	case strings.HasSuffix(args[0], ".cue"):
 		os.Exit(cmdRun(args))
 	default:
-		fmt.Fprintln(os.Stderr, "usage: cue [run|check] <file.cue> [--json] | cue catalog [--json] | cue repl")
+		fmt.Fprintln(os.Stderr, "usage: cue [run|check] <file.cue> [--json] | cue catalog [--json] | cue replay <log> <file.cue> [--json] | cue repl")
 		os.Exit(2)
 	}
 }
@@ -198,6 +205,86 @@ func cmdRun(args []string) int {
 	}
 
 	// Human mode: print nothing for null, the value otherwise; errors to stderr.
+	if e, ok := result.(*object.Error); ok {
+		fmt.Fprintln(os.Stderr, formatDiag(path, errorToDiag(e)))
+		return 1
+	}
+	if _, isNull := result.(*object.Null); !isNull && result != nil {
+		fmt.Println(result.Inspect())
+	}
+	return 0
+}
+
+// cmdReplay deterministically replays a program against a prior effect log
+// (DESIGN.md §10, §11). It loads the JSONL log into a replay.Source, parses the
+// program, and runs it with WithReplay so every effect-producing call (tool Invoke,
+// llm provider, ask_human stdin) returns its recorded outcome — keyed by
+// (branch, callsite, occurrence), never seq — instead of touching the outside
+// world. The envelope is the same shape as `cue run`, so an agent reads a replay
+// exactly as it reads a run; a program edit that breaks a call-site match surfaces
+// as a CUE_REPLAY_001 diagnostic.
+func cmdReplay(args []string) int {
+	pos, asJSON := popFlag(args, "--json")
+	if len(pos) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: cue replay <log> <file.cue> [--json]")
+		return 2
+	}
+	logPath, path := pos[0], pos[1]
+
+	src, err := replay.Load(logPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cue: %v\n", err)
+		return 1
+	}
+
+	srcBytes, err := os.ReadFile(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cue: %v\n", err)
+		return 1
+	}
+	source := string(srcBytes)
+
+	p := parser.New(lexer.New(source))
+	program := p.ParseProgram()
+	if p.HasErrors() {
+		if asJSON {
+			return emitEnvelope(nil, p.Diagnostics(), nil, source)
+		}
+		for _, d := range p.Diagnostics() {
+			fmt.Fprintln(os.Stderr, formatDiag(path, d))
+		}
+		return 1
+	}
+
+	reg := newRegistry()
+	env := object.NewEnvironment()
+	injectNamespaces(env, reg)
+
+	// A fresh recorder captures the replayed effects so the envelope shows them and
+	// a new log could be produced from this replay (DESIGN.md §10). Replay never
+	// reaches the policy gate, so no policy/prompter wiring is needed.
+	effects := effectlog.NewRecorder()
+	opts := []evaluator.Option{
+		evaluator.WithContext(context.Background()),
+		evaluator.WithEffects(effects),
+		evaluator.WithReplay(src),
+	}
+	if asJSON {
+		opts = append(opts, evaluator.WithOutput(os.Stderr))
+	}
+	interp := evaluator.New(opts...)
+	result := interp.Eval(program, env)
+
+	if asJSON {
+		var diags []diag.Diagnostic
+		var value object.Object = result
+		if e, ok := result.(*object.Error); ok {
+			diags = append(diags, errorToDiag(e))
+			value = nil
+		}
+		return emitEnvelope(value, diags, effects.Records(), source)
+	}
+
 	if e, ok := result.(*object.Error); ok {
 		fmt.Fprintln(os.Stderr, formatDiag(path, errorToDiag(e)))
 		return 1

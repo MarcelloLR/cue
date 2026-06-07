@@ -4,7 +4,9 @@ package object
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -272,5 +274,71 @@ func ToAny(o Object) any {
 		return out
 	default:
 		return o.Inspect()
+	}
+}
+
+// FromAny is the inverse of ToAny: it lifts a plain Go/JSON value (the shape an
+// effect-log result is stored as) back into a Cue runtime value. It is what
+// deterministic replay uses to reconstruct a recorded tool/llm/ask_human result
+// without re-invoking anything (DESIGN.md §10), and it round-trips ToAny's output:
+//
+//	nil            -> Null
+//	bool           -> Boolean
+//	string         -> String
+//	int / int64    -> Integer
+//	float64        -> Float (or Integer when it is an exact whole number, so a JSON
+//	                  log that decoded an int as a float still reconstructs an int)
+//	json.Number    -> Integer when it parses as one, else Float
+//	[]any          -> Array (elements reconstructed recursively)
+//	map[string]any -> Hash (keys sorted for a deterministic, stable order)
+//
+// An unrecognised Go type falls back to its fmt form as a String, mirroring how
+// ToAny renders non-data values to a string — replay never panics on odd input.
+func FromAny(v any) Object {
+	switch x := v.(type) {
+	case nil:
+		return &Null{}
+	case bool:
+		return &Boolean{Value: x}
+	case string:
+		return &String{Value: x}
+	case int:
+		return &Integer{Value: int64(x)}
+	case int64:
+		return &Integer{Value: x}
+	case float64:
+		// JSON has no integer type, so a logged int64 decodes as a whole-number
+		// float64; reconstruct it as an Integer to faithfully round-trip ToAny.
+		if x == float64(int64(x)) {
+			return &Integer{Value: int64(x)}
+		}
+		return &Float{Value: x}
+	case json.Number:
+		if n, err := x.Int64(); err == nil {
+			return &Integer{Value: n}
+		}
+		if f, err := x.Float64(); err == nil {
+			return &Float{Value: f}
+		}
+		return &String{Value: x.String()}
+	case []any:
+		elems := make([]Object, 0, len(x))
+		for _, e := range x {
+			elems = append(elems, FromAny(e))
+		}
+		return &Array{Elements: elems}
+	case map[string]any:
+		h := NewHash()
+		keys := make([]string, 0, len(x))
+		for k := range x {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			h.Set(k, FromAny(x[k]))
+		}
+		return h
+	default:
+		return &String{Value: fmt.Sprint(x)}
 	}
 }

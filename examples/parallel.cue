@@ -2,6 +2,11 @@
 // Run with:        cue run examples/parallel.cue
 // Machine output:  cue run examples/parallel.cue --json   (the §9 envelope)
 // Pre-flight:      cue check examples/parallel.cue --json  (no execution)
+// Replay (§10):    cue run examples/parallel.cue --log run.jsonl   (capture)
+//                  cue replay run.jsonl examples/parallel.cue      (re-run from log)
+//   The tool calls below return their recorded outputs on replay, so the run
+//   reproduces exactly even though parallel scheduling (and thus seq) varies —
+//   replay keys on (branch, callsite, occurrence), never seq (DESIGN.md §10).
 //
 // `parallel (i in xs) { body }` evaluates `body` for each element concurrently
 // (goroutines + errgroup + a shared context) and collects the results into an

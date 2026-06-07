@@ -48,6 +48,40 @@ func recOcc(r *Recorder, branch, callsite string) int {
 	return r.Records()[seq].Occurrence
 }
 
+// TestReserveAndAppendShareOneCounter verifies the single-source occurrence
+// counting deterministic replay relies on (DESIGN.md §10): Reserve (used by the
+// replay lookup) and Append (used by a live run) both advance the SAME per-(branch,
+// callsite) counter, and AppendReserved stores a reserved occurrence without
+// advancing it again. So a replay that Reserves then AppendReserves ticks the
+// counter exactly once per effect, identically to a live Append.
+func TestReserveAndAppendShareOneCounter(t *testing.T) {
+	r := NewRecorder()
+
+	// A live Append takes occurrence 0; an Append on the same key takes 1.
+	if got := recOcc(r, "root", "1:1"); got != 0 {
+		t.Errorf("append occurrence = %d, want 0", got)
+	}
+	// Reserve continues the same counter from where Append left off.
+	if got := r.Reserve("root", "1:1"); got != 1 {
+		t.Errorf("reserve occurrence = %d, want 1 (same counter as append)", got)
+	}
+	// AppendReserved stores at the reserved occurrence without re-advancing.
+	seq := r.AppendReserved(Record{Branch: "root", Callsite: "1:1", Occurrence: 1, Tool: "t", Status: "ok"})
+	if occ := r.Records()[seq].Occurrence; occ != 1 {
+		t.Errorf("AppendReserved stored occurrence = %d, want 1", occ)
+	}
+	// The next Append takes occurrence 2 — the counter advanced exactly once for the
+	// reserved effect, not twice.
+	if got := recOcc(r, "root", "1:1"); got != 2 {
+		t.Errorf("next append occurrence = %d, want 2 (reserve advanced the counter once)", got)
+	}
+
+	// A different (branch, callsite) reserves independently from 0.
+	if got := r.Reserve("parallel:0", "1:1"); got != 0 {
+		t.Errorf("reserve on a new key = %d, want 0", got)
+	}
+}
+
 // TestDefaultBranchIsRoot confirms an unset Branch defaults to "root".
 func TestDefaultBranchIsRoot(t *testing.T) {
 	r := NewRecorder()
