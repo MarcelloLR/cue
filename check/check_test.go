@@ -126,6 +126,32 @@ func TestCheckBuiltinArity(t *testing.T) {
 	}
 }
 
+func TestCheckParallelCleanAndScoped(t *testing.T) {
+	// The loop var is in scope inside the body, and the body/iterable/limit are
+	// all walked so a clean parallel form yields no diagnostics.
+	src := `
+		let xs = ["a", "b"]
+		parallel (x in xs, limit = 2) { strings.upper(x) }
+	`
+	if diags := checkSrc(t, src); len(diags) != 0 {
+		t.Fatalf("expected no diagnostics, got %+v", diags)
+	}
+}
+
+func TestCheckParallelWalksBody(t *testing.T) {
+	// An unknown identifier inside the body is still reported (the checker
+	// descends into the parallel body).
+	diags := checkSrc(t, `parallel (x in [1]) { strings.upper(nope) }`)
+	if findCode(diags, diag.NameUnknownIdent) == nil {
+		t.Fatalf("expected CUE_NAME_001 for nope in body, got %+v", diags)
+	}
+	// And it validates tool arity inside the body.
+	diags = checkSrc(t, `parallel (x in [1]) { strings.upper(x, x) }`)
+	if findCode(diags, diag.TypeArgCount) == nil {
+		t.Fatalf("expected CUE_TYPE_004 in body, got %+v", diags)
+	}
+}
+
 func TestCheckShadowingSilencesNamespace(t *testing.T) {
 	// A local binding shadows the http namespace name; member access on it is
 	// dynamic, so the checker stays silent (conservative, no false positive).

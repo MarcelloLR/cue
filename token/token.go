@@ -72,29 +72,31 @@ const (
 	RBRACKET TokenType = "]"
 
 	// Keywords.
-	LET    TokenType = "LET"
-	FN     TokenType = "FN"
-	IF     TokenType = "IF"
-	ELSE   TokenType = "ELSE"
-	FOR    TokenType = "FOR"
-	IN     TokenType = "IN"
-	RETURN TokenType = "RETURN"
-	TRUE   TokenType = "TRUE"
-	FALSE  TokenType = "FALSE"
-	NULL   TokenType = "NULL"
+	LET      TokenType = "LET"
+	FN       TokenType = "FN"
+	IF       TokenType = "IF"
+	ELSE     TokenType = "ELSE"
+	FOR      TokenType = "FOR"
+	IN       TokenType = "IN"
+	RETURN   TokenType = "RETURN"
+	TRUE     TokenType = "TRUE"
+	FALSE    TokenType = "FALSE"
+	NULL     TokenType = "NULL"
+	PARALLEL TokenType = "PARALLEL"
 )
 
 var keywords = map[string]TokenType{
-	"let":    LET,
-	"fn":     FN,
-	"if":     IF,
-	"else":   ELSE,
-	"for":    FOR,
-	"in":     IN,
-	"return": RETURN,
-	"true":   TRUE,
-	"false":  FALSE,
-	"null":   NULL,
+	"let":      LET,
+	"fn":       FN,
+	"if":       IF,
+	"else":     ELSE,
+	"for":      FOR,
+	"in":       IN,
+	"return":   RETURN,
+	"true":     TRUE,
+	"false":    FALSE,
+	"null":     NULL,
+	"parallel": PARALLEL,
 }
 
 // LookupIdent maps an identifier to its keyword type, or IDENT if it is not a

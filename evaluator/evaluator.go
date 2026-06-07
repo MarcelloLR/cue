@@ -18,6 +18,8 @@ import (
 	"fmt"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/MarcelloLR/cue/ast"
 	"github.com/MarcelloLR/cue/diag"
 	"github.com/MarcelloLR/cue/object"
@@ -26,6 +28,11 @@ import (
 	"github.com/MarcelloLR/cue/runtime/registry"
 	"github.com/MarcelloLR/cue/token"
 )
+
+// DefaultParallelLimit bounds how many `parallel` branches run at once when the
+// program does not give an inline `limit =` (DESIGN.md §6). Tool/LLM calls are
+// IO-bound, so the cap exists to avoid unbounded fan-out, not CPU contention.
+const DefaultParallelLimit = 8
 
 // Shared singletons for the immutable values.
 var (
@@ -39,12 +46,21 @@ var (
 // logging, prompts) needs a place to hang state, and threading it through methods
 // now avoids a disruptive refactor later (DESIGN.md §13).
 type Interp struct {
-	// Ctx is honoured by tool Invoke calls for cancellation/timeouts.
+	// Ctx is honoured by tool Invoke calls for cancellation/timeouts. Inside a
+	// `parallel` branch this is the errgroup-derived child context, so a sibling's
+	// error (or a top-level cancel) cancels in-flight Invoke calls (DESIGN.md §6).
 	Ctx context.Context
 	// Policy gates every tool call before it runs (DESIGN.md §7).
 	Policy policy.Policy
-	// Effects records every gated tool call for the run envelope (§7, §9).
+	// Effects records every gated tool call for the run envelope (§7, §9). Parallel
+	// branches share one Recorder (it is goroutine-safe), so the whole run stays in
+	// one ledger; each record is tagged with the branch it ran on.
 	Effects *effectlog.Recorder
+	// Branch is the concurrency path of this Interp: "root" at the top level, and
+	// "parallel:k" (nested as "parent/parallel:k") inside a parallel branch. It is
+	// stamped onto every effect record so concurrent runs stay reconstructable and,
+	// later, replayable (DESIGN.md §6, §10).
+	Branch string
 }
 
 // Option configures an Interp at construction.
@@ -59,13 +75,18 @@ func WithPolicy(p policy.Policy) Option { return func(i *Interp) { i.Policy = p 
 // WithEffects sets the effect recorder. Defaults to a fresh recorder.
 func WithEffects(r *effectlog.Recorder) Option { return func(i *Interp) { i.Effects = r } }
 
+// WithBranch sets the concurrency-path label stamped onto effect records.
+func WithBranch(branch string) Option { return func(i *Interp) { i.Branch = branch } }
+
 // New returns an Interp with sensible defaults: a background context, the
-// allow-all policy, and a fresh effect recorder. Options override these.
+// allow-all policy, a fresh effect recorder, and the "root" branch. Options
+// override these.
 func New(opts ...Option) *Interp {
 	i := &Interp{
 		Ctx:     context.Background(),
 		Policy:  policy.AllowAll{},
 		Effects: effectlog.NewRecorder(),
+		Branch:  "root",
 	}
 	for _, opt := range opts {
 		opt(i)
@@ -148,6 +169,8 @@ func (i *Interp) Eval(node ast.Node, env *object.Environment) object.Object {
 		return i.evalIfExpression(node, env)
 	case *ast.ForExpression:
 		return i.evalForExpression(node, env)
+	case *ast.ParallelExpression:
+		return i.evalParallelExpression(node, env)
 	case *ast.CallExpression:
 		return i.evalCallExpression(node, env)
 	case *ast.IndexExpression:
@@ -481,6 +504,153 @@ func (i *Interp) evalForExpression(node *ast.ForExpression, env *object.Environm
 	return NULL
 }
 
+// evalParallelExpression runs the parallel map form (DESIGN.md §6, normative).
+// It materializes the iterable into an ordered item list, then evaluates the body
+// for each item concurrently on a golang.org/x/sync/errgroup bounded by limit and
+// sharing a derived context. Results land in a pre-sized slice at each item's
+// input index, so the returned Array is always in input order regardless of
+// completion order. The first body to yield an *object.Error returns it as a Go
+// error, which cancels the shared context (errgroup semantics); that first error
+// becomes the expression's value. Every branch gets its own enclosed environment
+// and its own child Interp (sharing only the goroutine-safe Effects recorder),
+// so no writable state is shared across goroutines.
+func (i *Interp) evalParallelExpression(node *ast.ParallelExpression, env *object.Environment) object.Object {
+	iterable := i.Eval(node.Iterable, env)
+	if isError(iterable) {
+		return iterable
+	}
+
+	items, errObj := i.parallelItems(node, iterable)
+	if errObj != nil {
+		return errObj
+	}
+
+	limit, errObj := i.parallelLimit(node, env)
+	if errObj != nil {
+		return errObj
+	}
+
+	n := len(items)
+	results := make([]object.Object, n)
+
+	g, gctx := errgroup.WithContext(i.Ctx)
+	g.SetLimit(limit)
+
+	for k := 0; k < n; k++ {
+		k, item := k, items[k]
+		g.Go(func() error {
+			// Each branch gets its own enclosed env and child Interp. The env is
+			// never shared between goroutines (only ancestor scopes are read, and
+			// those are not written during the parallel region). The child Interp
+			// shares the goroutine-safe Effects recorder and the Policy, runs under
+			// the errgroup's context so a sibling error cancels it, and carries the
+			// branch label for effect tagging (DESIGN.md §6).
+			branchEnv := object.NewEnclosedEnvironment(env)
+			branchEnv.Set(node.Var.Value, item)
+
+			child := &Interp{
+				Ctx:     gctx,
+				Policy:  i.Policy,
+				Effects: i.Effects,
+				Branch:  i.branchLabel(k),
+			}
+
+			result := child.Eval(node.Body, branchEnv)
+			if e, ok := result.(*object.Error); ok {
+				// Surface the runtime error as a Go error so errgroup cancels the
+				// rest via gctx; the *object.Error is recovered after Wait.
+				return &branchError{err: e}
+			}
+			// A `return` inside the body unwinds to its value, mirroring how a
+			// function body collapses a ReturnValue (DESIGN.md §5).
+			if rv, ok := result.(*object.ReturnValue); ok {
+				result = rv.Value
+			}
+			results[k] = result
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		if be, ok := err.(*branchError); ok {
+			return be.err
+		}
+		// errgroup only ever sees branchError values from our g.Go closures, so
+		// this is unreachable; report defensively rather than panic.
+		return newError(node, diag.RuntimeBuiltin, "parallel: %s", err.Error())
+	}
+	return &object.Array{Elements: results}
+}
+
+// branchError carries an *object.Error out of a parallel branch as a Go error so
+// errgroup can use it to cancel siblings; evalParallelExpression unwraps the
+// first one back into the expression's value.
+type branchError struct{ err *object.Error }
+
+func (b *branchError) Error() string { return b.err.Message }
+
+// branchLabel builds the branch path for the k-th parallel branch. At the top
+// level it is "parallel:k"; nested inside another branch it is
+// "<parent>/parallel:k" so the full concurrency path stays reconstructable
+// (DESIGN.md §6, §10).
+func (i *Interp) branchLabel(k int) string {
+	label := fmt.Sprintf("parallel:%d", k)
+	if i.Branch != "" && i.Branch != "root" {
+		return i.Branch + "/" + label
+	}
+	return label
+}
+
+// parallelItems materializes an iterable into the ordered list of items the
+// parallel map binds its loop variable over, matching `for`'s iteration sources
+// (arrays, hash keys, string runes) for consistency (DESIGN.md §5, §6).
+func (i *Interp) parallelItems(node *ast.ParallelExpression, iterable object.Object) ([]object.Object, *object.Error) {
+	switch it := iterable.(type) {
+	case *object.Array:
+		items := make([]object.Object, len(it.Elements))
+		copy(items, it.Elements)
+		return items, nil
+	case *object.String:
+		runes := []rune(it.Value)
+		items := make([]object.Object, len(runes))
+		for idx, ch := range runes {
+			items[idx] = &object.String{Value: string(ch)}
+		}
+		return items, nil
+	case *object.Hash:
+		items := make([]object.Object, len(it.Keys))
+		for idx, k := range it.Keys {
+			items[idx] = &object.String{Value: k}
+		}
+		return items, nil
+	default:
+		return nil, newError(node, diag.TypeNotIterable, "%s is not iterable", iterable.Type())
+	}
+}
+
+// parallelLimit resolves the bound on concurrency: the inline `limit =` value
+// when present (which must be a positive integer), else DefaultParallelLimit
+// (DESIGN.md §6).
+func (i *Interp) parallelLimit(node *ast.ParallelExpression, env *object.Environment) (int, *object.Error) {
+	if node.Limit == nil {
+		return DefaultParallelLimit, nil
+	}
+	val := i.Eval(node.Limit, env)
+	if e, ok := val.(*object.Error); ok {
+		return 0, e
+	}
+	n, ok := val.(*object.Integer)
+	if !ok {
+		return 0, newError(node.Limit, diag.TypeMismatch,
+			"parallel limit must be INTEGER, got %s", val.Type())
+	}
+	if n.Value <= 0 {
+		return 0, newError(node.Limit, diag.TypeMismatch,
+			"parallel limit must be a positive integer, got %d", n.Value)
+	}
+	return int(n.Value), nil
+}
+
 func (i *Interp) evalCallExpression(node *ast.CallExpression, env *object.Environment) object.Object {
 	fn := i.Eval(node.Function, env)
 	if isError(fn) {
@@ -554,6 +724,7 @@ func (i *Interp) invokeTool(node *ast.CallExpression, tool *object.Tool, args []
 	// global sequence number.
 	rec := effectlog.Record{
 		Callsite:   callsite(node),
+		Branch:     i.Branch,
 		Tool:       impl.Name(),
 		Args:       renderArgs(args),
 		Reversible: impl.Reversibility() == object.Reversible,
