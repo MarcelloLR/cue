@@ -1,10 +1,19 @@
 // Command cue is the Cue interpreter CLI (DESIGN.md §11).
 //
-//	cue run <file.cue> [--json] [--log <path>] [--policy <path>]
+//	cue run <file.cue> [--json] [--log <path>] [--sqlite <path>] [--policy <path>]
 //	                                parse and execute a program; --log streams the
-//	                                effect log as JSONL, --policy gates tool calls
+//	                                effect log as JSONL, --sqlite also writes it to a
+//	                                queryable SQLite db, --policy gates tool calls
 //	cue check <file.cue> [--json]   static checks only, no execution
 //	cue catalog [--json]            available tools + grammar (the agent prompt)
+//	cue replay <log> <file.cue> [--json]
+//	                                deterministically replay a program against a
+//	                                prior effect log: effect-producing calls return
+//	                                their recorded outcomes instead of running
+//	cue rollback <log> [--json] [--policy <path>] [--log <path>]
+//	                                walk a prior effect log backward, firing each
+//	                                successful reversible call's captured compensation
+//	                                to undo the run's side effects
 //	cue <file.cue>                  shorthand for `cue run`
 //	cue repl                        start an interactive session
 //	cue                             start an interactive session
@@ -32,6 +41,9 @@ import (
 	"github.com/MarcelloLR/cue/runtime/envelope"
 	"github.com/MarcelloLR/cue/runtime/policy"
 	"github.com/MarcelloLR/cue/runtime/registry"
+	"github.com/MarcelloLR/cue/runtime/replay"
+	"github.com/MarcelloLR/cue/runtime/rollback"
+	"github.com/MarcelloLR/cue/runtime/sqlitelog"
 	"github.com/MarcelloLR/cue/runtime/tools"
 )
 
@@ -48,10 +60,14 @@ func main() {
 		os.Exit(cmdCheck(args[1:]))
 	case args[0] == "catalog":
 		os.Exit(cmdCatalog(args[1:]))
+	case args[0] == "replay":
+		os.Exit(cmdReplay(args[1:]))
+	case args[0] == "rollback":
+		os.Exit(cmdRollback(args[1:]))
 	case strings.HasSuffix(args[0], ".cue"):
 		os.Exit(cmdRun(args))
 	default:
-		fmt.Fprintln(os.Stderr, "usage: cue [run|check] <file.cue> [--json] | cue catalog [--json] | cue repl")
+		fmt.Fprintln(os.Stderr, "usage: cue [run|check] <file.cue> [--json] | cue catalog [--json] | cue replay <log> <file.cue> [--json] | cue rollback <log> [--json] [--policy <path>] [--log <path>] | cue repl")
 		os.Exit(2)
 	}
 }
@@ -107,13 +123,18 @@ func popValueFlag(args []string, name string) (rest []string, value string, pres
 func cmdRun(args []string) int {
 	args, asJSON := popFlag(args, "--json")
 	args, logPath, hasLog := popValueFlag(args, "--log")
+	args, dbPath, hasDB := popValueFlag(args, "--sqlite")
 	pos, policyPath, hasPolicy := popValueFlag(args, "--policy")
 	if len(pos) < 1 {
-		fmt.Fprintln(os.Stderr, "usage: cue run <file.cue> [--json] [--log <path>] [--policy <path>]")
+		fmt.Fprintln(os.Stderr, "usage: cue run <file.cue> [--json] [--log <path>] [--sqlite <path>] [--policy <path>]")
 		return 2
 	}
 	if hasLog && logPath == "" {
 		fmt.Fprintln(os.Stderr, "cue: --log requires a path")
+		return 2
+	}
+	if hasDB && dbPath == "" {
+		fmt.Fprintln(os.Stderr, "cue: --sqlite requires a path")
 		return 2
 	}
 	if hasPolicy && policyPath == "" {
@@ -170,6 +191,17 @@ func cmdRun(args []string) int {
 		defer logFile.Close()
 		effects.SetSink(logFile)
 	}
+	// --sqlite adds the queryable SQLite backend alongside (or instead of) JSONL: the
+	// same records also land in an `effects` table for SQL access (DESIGN.md §7).
+	if hasDB {
+		dbSink, err := sqlitelog.Open(dbPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "cue: --sqlite: %v\n", err)
+			return 1
+		}
+		defer dbSink.Close()
+		effects.AddSink(dbSink)
+	}
 
 	opts := []evaluator.Option{
 		evaluator.WithContext(context.Background()),
@@ -206,6 +238,190 @@ func cmdRun(args []string) int {
 		fmt.Println(result.Inspect())
 	}
 	return 0
+}
+
+// cmdReplay deterministically replays a program against a prior effect log
+// (DESIGN.md §10, §11). It loads the JSONL log into a replay.Source, parses the
+// program, and runs it with WithReplay so every effect-producing call (tool Invoke,
+// llm provider, ask_human stdin) returns its recorded outcome — keyed by
+// (branch, callsite, occurrence), never seq — instead of touching the outside
+// world. The envelope is the same shape as `cue run`, so an agent reads a replay
+// exactly as it reads a run; a program edit that breaks a call-site match surfaces
+// as a CUE_REPLAY_001 diagnostic.
+func cmdReplay(args []string) int {
+	pos, asJSON := popFlag(args, "--json")
+	if len(pos) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: cue replay <log> <file.cue> [--json]")
+		return 2
+	}
+	logPath, path := pos[0], pos[1]
+
+	src, err := replay.Load(logPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cue: %v\n", err)
+		return 1
+	}
+
+	srcBytes, err := os.ReadFile(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cue: %v\n", err)
+		return 1
+	}
+	source := string(srcBytes)
+
+	p := parser.New(lexer.New(source))
+	program := p.ParseProgram()
+	if p.HasErrors() {
+		if asJSON {
+			return emitEnvelope(nil, p.Diagnostics(), nil, source)
+		}
+		for _, d := range p.Diagnostics() {
+			fmt.Fprintln(os.Stderr, formatDiag(path, d))
+		}
+		return 1
+	}
+
+	reg := newRegistry()
+	env := object.NewEnvironment()
+	injectNamespaces(env, reg)
+
+	// A fresh recorder captures the replayed effects so the envelope shows them and
+	// a new log could be produced from this replay (DESIGN.md §10). Replay never
+	// reaches the policy gate, so no policy/prompter wiring is needed.
+	effects := effectlog.NewRecorder()
+	opts := []evaluator.Option{
+		evaluator.WithContext(context.Background()),
+		evaluator.WithEffects(effects),
+		evaluator.WithReplay(src),
+	}
+	if asJSON {
+		opts = append(opts, evaluator.WithOutput(os.Stderr))
+	}
+	interp := evaluator.New(opts...)
+	result := interp.Eval(program, env)
+
+	if asJSON {
+		var diags []diag.Diagnostic
+		var value object.Object = result
+		if e, ok := result.(*object.Error); ok {
+			diags = append(diags, errorToDiag(e))
+			value = nil
+		}
+		return emitEnvelope(value, diags, effects.Records(), source)
+	}
+
+	if e, ok := result.(*object.Error); ok {
+		fmt.Fprintln(os.Stderr, formatDiag(path, errorToDiag(e)))
+		return 1
+	}
+	if _, isNull := result.(*object.Null); !isNull && result != nil {
+		fmt.Println(result.Inspect())
+	}
+	return 0
+}
+
+// cmdRollback walks a prior effect log backward, firing the captured compensation for
+// each successful, reversible call to undo a run's side effects (DESIGN.md §7, §11).
+// It loads the JSONL log (the same loader replay uses), then drives runtime/rollback
+// with an Interp on the "rollback" branch so each inverse is gated by --policy and
+// recorded as a §9 effect — a compensation is a tool call like any other, just driven
+// from the log. The envelope is the same shape as `cue run`: its effects are the
+// inverses fired, and ok:false when any compensation failed or was denied. --log
+// streams those inverse records to a fresh JSONL file (an audit trail of the undo).
+func cmdRollback(args []string) int {
+	args, asJSON := popFlag(args, "--json")
+	args, logPath, hasLog := popValueFlag(args, "--log")
+	pos, policyPath, hasPolicy := popValueFlag(args, "--policy")
+	if len(pos) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: cue rollback <log> [--json] [--policy <path>] [--log <path>]")
+		return 2
+	}
+	if hasLog && logPath == "" {
+		fmt.Fprintln(os.Stderr, "cue: --log requires a path")
+		return 2
+	}
+	if hasPolicy && policyPath == "" {
+		fmt.Fprintln(os.Stderr, "cue: --policy requires a path")
+		return 2
+	}
+	logToReverse := pos[0]
+
+	// Load the policy first: a malformed --policy is a setup error, and gating the
+	// inverses is the whole point of routing them through the pipeline (DESIGN.md §7).
+	var pol policy.Policy = policy.AllowAll{}
+	if hasPolicy {
+		cfg, err := policy.Load(policyPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			return 2
+		}
+		pol = cfg
+	}
+
+	records, err := replay.LoadRecords(logToReverse)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cue: %v\n", err)
+		return 1
+	}
+
+	reg := newRegistry()
+
+	// A fresh recorder captures the inverses fired so the envelope shows them and a
+	// new log of the undo can be produced (--log).
+	effects := effectlog.NewRecorder()
+	if hasLog {
+		logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "cue: --log: %v\n", err)
+			return 1
+		}
+		defer logFile.Close()
+		effects.SetSink(logFile)
+	}
+
+	opts := []evaluator.Option{
+		evaluator.WithContext(context.Background()),
+		evaluator.WithEffects(effects),
+		evaluator.WithPolicy(pol),
+		// Tag every fired inverse with the "rollback" branch so the §9 effects clearly
+		// distinguish the undo from the original run (DESIGN.md §6, §7).
+		evaluator.WithBranch("rollback"),
+	}
+	if asJSON {
+		opts = append(opts, evaluator.WithOutput(os.Stderr))
+	}
+	interp := evaluator.New(opts...)
+	// A policy Prompt on a compensation routes through the same interactive prompter
+	// `cue run` uses, sharing the run's prompt channel.
+	interp.Prompter = evaluator.NewInteractivePrompter(interp)
+
+	res := rollback.Rollback(records, reg, interp)
+
+	if asJSON {
+		// No program value to report; the rollback's effects ARE the result. A failed
+		// or denied compensation surfaces as ok:false via a diagnostic.
+		var diags []diag.Diagnostic
+		if !res.OK {
+			diags = append(diags, diag.Diagnostic{
+				Code:     diag.ToolFailure,
+				Severity: diag.SeverityError,
+				Message:  rollbackSummary(res),
+			})
+		}
+		return emitEnvelope(nil, diags, effects.Records(), "")
+	}
+
+	fmt.Fprintf(os.Stderr, "rollback: %s\n", rollbackSummary(res))
+	if !res.OK {
+		return 1
+	}
+	return 0
+}
+
+// rollbackSummary renders a one-line human summary of a rollback pass.
+func rollbackSummary(res rollback.Result) string {
+	return fmt.Sprintf("considered %d, fired %d (ok %d, failed %d), denied %d",
+		res.Considered, res.Fired, res.Succeeded, res.Failed, res.Denied)
 }
 
 // cmdCheck runs lex + parse + static checks without executing (DESIGN.md §9).

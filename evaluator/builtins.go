@@ -118,6 +118,14 @@ func (i *Interp) askHumanBuiltin(node ast.Node) *object.Builtin {
 				"ask_human: prompt must be STRING, got %s", args[0].Type())
 		}
 		rec := i.newRecord(node, "ask_human", args, false)
+
+		// Deterministic replay (DESIGN.md §10): return the recorded human answer
+		// instead of reading stdin. Recording the human's input is precisely what
+		// makes ask_human replayable (§8), so no prompt is shown and In is never read.
+		if i.replaying() {
+			return i.replayEffect(node, rec)
+		}
+
 		line, err := i.promptLine(prompt.Value + " ")
 		if err != nil {
 			return i.recordError(node, rec, "ask_human: "+err.Error())
@@ -152,6 +160,15 @@ func (i *Interp) llmBuiltin(node ast.Node) *object.Builtin {
 		}
 
 		rec := i.newRecord(node, "llm", args, true)
+
+		// Deterministic replay (DESIGN.md §10): return the recorded completion
+		// instead of calling the provider, skipping the gate. A schema request's
+		// recorded result was stored as the validated Hash, so FromAny reconstructs
+		// the same shape; a free-form request reconstructs the recorded String.
+		if i.replaying() {
+			return i.replayEffect(node, rec)
+		}
+
 		if denied := i.gate(node, rec, "llm", args, object.Reversible); denied != nil {
 			return denied
 		}

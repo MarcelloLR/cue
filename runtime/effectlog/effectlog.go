@@ -97,6 +97,20 @@ type Recorder struct {
 	// (DESIGN.md §7 durable JSONL). Writes happen under mu so the stream stays in
 	// append order and goroutine-safe.
 	sink io.Writer
+	// sinks receive each appended record via WriteRecord, for storage backends
+	// richer than line-oriented JSONL (e.g. the SQLite "queryable upgrade",
+	// DESIGN.md §7). Like the JSONL sink they are driven under mu, in append order.
+	sinks []Sink
+}
+
+// Sink receives each record as it is appended, for durable or queryable storage
+// beyond the in-memory ledger (DESIGN.md §7). The SQLite backend is a Sink. Because
+// the Recorder calls WriteRecord under its lock and in append order, implementations
+// need no locking of their own. A returned error is swallowed by the Recorder (the
+// audit log is a side-channel and must never break a user program), so a Sink that
+// wants to surface failures should do so out-of-band.
+type Sink interface {
+	WriteRecord(Record) error
 }
 
 // NewRecorder returns an empty Recorder with the default wall-clock.
@@ -115,6 +129,53 @@ func (r *Recorder) SetSink(w io.Writer) {
 	r.sink = w
 }
 
+// AddSink registers a Sink to receive every subsequently appended record. It is
+// the seam the SQLite backend (`cue run --sqlite <path>`) wires in, alongside or
+// instead of the JSONL sink. Records already appended are not back-filled; call it
+// before recording begins.
+func (r *Recorder) AddSink(s Sink) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.sinks = append(r.sinks, s)
+}
+
+// occKey builds the per-(branch, callsite) counter key. Branch is normalised to
+// "root" when empty, matching the default applied on append, so the live recorder
+// and the replay lookup that share this counter agree on the key (DESIGN.md §10).
+func occKey(branch, callsite string) string {
+	if branch == "" {
+		branch = "root"
+	}
+	return branch + "\x00" + callsite
+}
+
+// nextOcc returns the next Occurrence for a (branch, callsite) and advances the
+// counter. It is the single source of truth for occurrence assignment: every
+// effect — whether appended by a live run or reserved by deterministic replay —
+// pulls its Occurrence from here exactly once, so the replay key cannot drift from
+// what a live run would have produced (DESIGN.md §10). It must be called under mu.
+func (r *Recorder) nextOcc(key string) int {
+	if r.occ == nil {
+		r.occ = map[string]int{}
+	}
+	occ := r.occ[key]
+	r.occ[key]++
+	return occ
+}
+
+// Reserve advances and returns the next Occurrence for (branch, callsite) without
+// storing a record. It is the seam deterministic replay uses to compute, in
+// lockstep with the live recorder, the (Branch, Callsite, Occurrence) key it looks
+// the recorded outcome up by — the occurrence MUST come from the same counter a
+// live Append would use, which is why both go through nextOcc (DESIGN.md §10). The
+// replay path follows a Reserve with AppendReserved so the counter advances exactly
+// once per effect. Branch defaults to "root" when unset.
+func (r *Recorder) Reserve(branch, callsite string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.nextOcc(occKey(branch, callsite))
+}
+
 // Append assigns the timestamp (from Clock), the scheduling-dependent Seq (global
 // append order) and the scheduling-independent Occurrence (per-(Branch, Callsite)
 // repeat index), stores the record, streams it to the sink if one is configured,
@@ -125,9 +186,29 @@ func (r *Recorder) Append(rec Record) int {
 	if rec.Branch == "" {
 		rec.Branch = "root"
 	}
-	if r.occ == nil {
-		r.occ = map[string]int{}
+	rec.Occurrence = r.nextOcc(occKey(rec.Branch, rec.Callsite))
+	return r.store(rec)
+}
+
+// AppendReserved stores a record whose Occurrence was already assigned by a prior
+// Reserve, leaving the occurrence counter untouched. Deterministic replay uses it
+// so a replayed effect still lands in the live ledger (and a fresh JSONL log) with
+// the same key it was looked up under, without double-counting the occurrence
+// (DESIGN.md §10). Branch defaults to "root" when unset.
+func (r *Recorder) AppendReserved(rec Record) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if rec.Branch == "" {
+		rec.Branch = "root"
 	}
+	return r.store(rec)
+}
+
+// store stamps the timestamp and global Seq, appends the record to the in-memory
+// slice, and streams it to the durable sink. It is the shared tail of Append and
+// AppendReserved and must be called under mu; it never touches the occurrence
+// counter — its callers own that decision (DESIGN.md §10).
+func (r *Recorder) store(rec Record) int {
 	clock := r.Clock
 	if clock == nil {
 		clock = time.Now
@@ -135,9 +216,6 @@ func (r *Recorder) Append(rec Record) int {
 	if rec.Ts == "" {
 		rec.Ts = clock().Format(time.RFC3339)
 	}
-	key := rec.Branch + "\x00" + rec.Callsite
-	rec.Occurrence = r.occ[key]
-	r.occ[key]++
 	rec.Seq = len(r.records)
 	r.records = append(r.records, rec)
 	r.writeSink(rec)
@@ -150,15 +228,17 @@ func (r *Recorder) Append(rec Record) int {
 // panic) a user program — the in-memory Records() still carry the truth for the
 // envelope (DESIGN.md §7, §9).
 func (r *Recorder) writeSink(rec Record) {
-	if r.sink == nil {
-		return
+	if r.sink != nil {
+		if line, err := json.Marshal(rec); err == nil {
+			line = append(line, '\n')
+			_, _ = r.sink.Write(line)
+		}
 	}
-	line, err := json.Marshal(rec)
-	if err != nil {
-		return
+	// Richer sinks (e.g. SQLite) receive the record as-is. Errors are swallowed for
+	// the same reason JSONL write errors are: the audit log must not break the run.
+	for _, s := range r.sinks {
+		_ = s.WriteRecord(rec)
 	}
-	line = append(line, '\n')
-	_, _ = r.sink.Write(line)
 }
 
 // Records returns a copy of the recorded entries in append order.

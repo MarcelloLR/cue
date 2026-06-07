@@ -55,6 +55,12 @@ const (
 	// Generic runtime errors.
 	RuntimeDivByZero = "CUE_RUNTIME_001"
 	RuntimeBuiltin   = "CUE_RUNTIME_002"
+
+	// Deterministic replay (DESIGN.md §10). Raised when a program is replayed
+	// against an effect log that has no recorded outcome for an effect's
+	// (branch, callsite, occurrence) key — typically because the program was edited
+	// so a call site moved, was added, or now runs a different number of times.
+	ReplayMismatch = "CUE_REPLAY_001"
 )
 
 // Diagnostic is a single structured report about the program. It is the unit of

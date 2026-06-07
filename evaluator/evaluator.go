@@ -31,6 +31,7 @@ import (
 	"github.com/MarcelloLR/cue/runtime/llm"
 	"github.com/MarcelloLR/cue/runtime/policy"
 	"github.com/MarcelloLR/cue/runtime/registry"
+	"github.com/MarcelloLR/cue/runtime/replay"
 	"github.com/MarcelloLR/cue/token"
 )
 
@@ -82,6 +83,13 @@ type Interp struct {
 	// deterministic llm.MockProvider so tests and examples need no network or API
 	// key; a real provider is swapped in at construction (DESIGN.md §8, §14).
 	LLM llm.Provider
+	// Replay, when non-nil, puts the run in deterministic-replay mode (DESIGN.md
+	// §10): instead of performing any side-effecting call (a tool's Invoke, the llm
+	// provider, ask_human's stdin), the effect primitives return the outcome recorded
+	// for that call's (Branch, Callsite, Occurrence) key in this Source. Nil means a
+	// normal run. It is shared by reference into `parallel` child Interps (like
+	// Effects) since a Source is immutable and safe for concurrent lookup.
+	Replay *replay.Source
 	// promptLock serializes the human-prompt critical section (ask_human and the
 	// interactive Prompter) across all sibling Interps. It is shared by reference:
 	// New() allocates one and every `parallel` child Interp copies the same pointer,
@@ -119,6 +127,11 @@ func WithInput(r io.Reader) Option { return func(i *Interp) { i.In = r } }
 // WithLLM sets the provider the `llm()` primitive calls. Defaults to an offline,
 // deterministic llm.MockProvider.
 func WithLLM(p llm.Provider) Option { return func(i *Interp) { i.LLM = p } }
+
+// WithReplay puts the Interp in deterministic-replay mode, serving recorded effect
+// outcomes from src instead of performing side effects (DESIGN.md §10). A nil src
+// leaves the run in normal mode.
+func WithReplay(src *replay.Source) Option { return func(i *Interp) { i.Replay = src } }
 
 // New returns an Interp with sensible defaults: a background context, the
 // allow-all policy, a fresh effect recorder, and the "root" branch. Options
@@ -303,6 +316,8 @@ func (i *Interp) Eval(node ast.Node, env *object.Environment) object.Object {
 		return i.evalForExpression(node, env)
 	case *ast.ParallelExpression:
 		return i.evalParallelExpression(node, env)
+	case *ast.ParallelBlockExpression:
+		return i.evalParallelBlockExpression(node, env)
 	case *ast.RetryExpression:
 		return i.evalRetryExpression(node, env)
 	case *ast.CallExpression:
@@ -693,21 +708,11 @@ func (i *Interp) evalParallelExpression(node *ast.ParallelExpression, env *objec
 			branchEnv := object.NewEnclosedEnvironment(env)
 			branchEnv.Set(node.Var.Value, item)
 
-			child := &Interp{
-				Ctx:      gctx,
-				Policy:   i.Policy,
-				Prompter: i.Prompter,
-				Effects:  i.Effects,
-				Branch:   i.branchLabel(k),
-				Out:      i.Out,
-				// In, LLM, and promptLock are shared by reference across siblings:
-				// the same *sync.Mutex serializes every branch's human-prompt
-				// critical section so concurrent ask_human calls (and interactive
-				// policy prompts) never interleave on stdin (DESIGN.md §6).
-				In:         i.In,
-				LLM:        i.LLM,
-				promptLock: i.promptLock,
-			}
+			// The child Interp shares the goroutine-safe Effects recorder, the policy,
+			// and the prompt channel by reference (see parallelChild); it runs under the
+			// errgroup context so a sibling error cancels it, and carries this branch's
+			// label for effect tagging and replay keying (DESIGN.md §6, §10).
+			child := i.parallelChild(gctx, i.branchLabel(k))
 
 			result := child.Eval(node.Body, branchEnv)
 			if e, ok := result.(*object.Error); ok {
@@ -736,6 +741,76 @@ func (i *Interp) evalParallelExpression(node *ast.ParallelExpression, env *objec
 	return &object.Array{Elements: results}
 }
 
+// evalParallelBlockExpression runs the parallel block form (DESIGN.md §3, §6 — Form
+// 2): `parallel { a = exprA; b = exprB }`. Each named branch's value expression is
+// evaluated concurrently on the SAME errgroup + shared-context machinery the map form
+// uses (bounded by DefaultParallelLimit), and the expression evaluates to a Hash
+// mapping each branch name to its result, IN SOURCE ORDER regardless of completion
+// order. The first branch to yield an *object.Error returns it as a Go error, which
+// cancels the shared context (errgroup semantics) and becomes the expression's value.
+//
+// Each branch gets its own enclosed environment and its own child Interp (sharing only
+// the goroutine-safe Effects recorder, the Policy/Prompter, In/LLM/promptLock, and the
+// immutable Replay Source — exactly like the map form), so no writable state is shared
+// across goroutines. The branch label is "parallel:<name>" (nested under any parent
+// branch), so effects from inside a block branch key on (branch, callsite, occurrence)
+// just as the map form's do — which is why replay works unchanged under the block form.
+//
+// The branch bindings do NOT leak into the outer scope: the Hash IS the result. Source
+// order is preserved by writing each branch's result into a pre-sized slice at its
+// declaration index, then assembling the Hash from that slice in order after Wait.
+func (i *Interp) evalParallelBlockExpression(node *ast.ParallelBlockExpression, env *object.Environment) object.Object {
+	n := len(node.Branches)
+	results := make([]object.Object, n)
+
+	g, gctx := errgroup.WithContext(i.Ctx)
+	g.SetLimit(DefaultParallelLimit)
+
+	for k := 0; k < n; k++ {
+		k, branch := k, node.Branches[k]
+		g.Go(func() error {
+			// Each branch evaluates in its own enclosed env (so a `let` inside it does
+			// not leak), under a child Interp that shares the goroutine-safe Effects
+			// recorder and runs on the errgroup's context so a sibling error cancels it.
+			// The branch label "parallel:<name>" tags every effect (DESIGN.md §6).
+			branchEnv := object.NewEnclosedEnvironment(env)
+			child := i.parallelChild(gctx, i.namedBranchLabel(branch.Name.Value))
+
+			result := child.Eval(branch.Value, branchEnv)
+			if e, ok := result.(*object.Error); ok {
+				// Surface as a Go error so errgroup cancels the rest via gctx; the
+				// *object.Error is recovered after Wait.
+				return &branchError{err: e}
+			}
+			// A `return` inside a branch value unwinds to its value, mirroring the map
+			// form and a function body (DESIGN.md §5).
+			if rv, ok := result.(*object.ReturnValue); ok {
+				result = rv.Value
+			}
+			results[k] = result
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		if be, ok := err.(*branchError); ok {
+			return be.err
+		}
+		// errgroup only ever sees branchError values from our g.Go closures, so this
+		// is unreachable; report defensively rather than panic.
+		return newError(node, diag.RuntimeBuiltin, "parallel: %s", err.Error())
+	}
+
+	// Assemble the result Hash in source (declaration) order. A duplicate branch name
+	// keeps the last write (Hash.Set semantics), but its key stays at first-seen
+	// position, matching how a hash literal with repeated keys behaves.
+	hash := object.NewHash()
+	for k, branch := range node.Branches {
+		hash.Set(branch.Name.Value, results[k])
+	}
+	return hash
+}
+
 // branchError carries an *object.Error out of a parallel branch as a Go error so
 // errgroup can use it to cancel siblings; evalParallelExpression unwraps the
 // first one back into the expression's value.
@@ -743,12 +818,48 @@ type branchError struct{ err *object.Error }
 
 func (b *branchError) Error() string { return b.err.Message }
 
-// branchLabel builds the branch path for the k-th parallel branch. At the top
-// level it is "parallel:k"; nested inside another branch it is
-// "<parent>/parallel:k" so the full concurrency path stays reconstructable
-// (DESIGN.md §6, §10).
+// parallelChild builds the child Interp a single parallel branch (map or block) runs
+// under: it shares the goroutine-safe Effects recorder, the Policy/Prompter, the
+// In/LLM/promptLock prompt channel (one *sync.Mutex serializes every branch's
+// human-prompt critical section so concurrent ask_human/confirm never interleave on
+// stdin, §6), and the immutable Replay Source — all by reference — while carrying the
+// errgroup context (so a sibling error cancels it) and this branch's label for effect
+// tagging (DESIGN.md §6, §10). Factoring it keeps the map and block forms building
+// identical child state from one place.
+func (i *Interp) parallelChild(gctx context.Context, branch string) *Interp {
+	return &Interp{
+		Ctx:        gctx,
+		Policy:     i.Policy,
+		Prompter:   i.Prompter,
+		Effects:    i.Effects,
+		Branch:     branch,
+		Out:        i.Out,
+		In:         i.In,
+		LLM:        i.LLM,
+		promptLock: i.promptLock,
+		Replay:     i.Replay,
+	}
+}
+
+// branchLabel builds the branch path for the k-th parallel map branch: "parallel:k"
+// at the top level, "<parent>/parallel:k" nested inside another branch so the full
+// concurrency path stays reconstructable (DESIGN.md §6, §10).
 func (i *Interp) branchLabel(k int) string {
-	label := fmt.Sprintf("parallel:%d", k)
+	return i.nestBranch(fmt.Sprintf("parallel:%d", k))
+}
+
+// namedBranchLabel builds the branch path for a parallel BLOCK branch: "parallel:name"
+// (nested under any parent branch). The block form keys effects exactly as the map form
+// does — only the leaf segment differs (a name instead of an index) — so replay works
+// unchanged under the block form (DESIGN.md §6, §10).
+func (i *Interp) namedBranchLabel(name string) string {
+	return i.nestBranch("parallel:" + name)
+}
+
+// nestBranch prefixes a leaf branch segment with this Interp's branch path when it is
+// itself inside a parallel branch, so nested parallels build a full path like
+// "parallel:0/parallel:b" (DESIGN.md §6, §10).
+func (i *Interp) nestBranch(label string) string {
 	if i.Branch != "" && i.Branch != "root" {
 		return i.Branch + "/" + label
 	}
@@ -916,11 +1027,43 @@ func (i *Interp) invokeTool(node *ast.CallExpression, tool *object.Tool, args []
 			"%s: wrong number of arguments: want %d, got %d", impl.Name(), len(sig.Params), len(args))
 	}
 
+	// Deterministic replay (DESIGN.md §10): serve the recorded outcome and skip the
+	// gate + Invoke entirely. The recorded record already reflects the original gate
+	// decision and tool result, so the call reproduces without touching the outside
+	// world. Arity is still checked above because a wrong-arity call is a program
+	// error in any mode.
+	if i.replaying() {
+		rev := impl.Reversibility()
+		rec := i.newRecord(node, impl.Name(), args, rev == object.Reversible)
+		return i.replayEffect(node, rec)
+	}
+
+	return i.invokeToolLive(node, tool, args)
+}
+
+// invokeToolLive runs the live half of the tool pipeline — arity check → policy
+// gate → effect-log the call → Invoke → log the result/error/compensation → return
+// (DESIGN.md §7) — shared by a source-level tool call (after its replay short-circuit)
+// and by rollback firing a captured compensation (InvokeCompensation). Keeping it one
+// method is why a compensation is gated, recorded, and coded exactly like any other
+// tool call. It takes an ast.Node (not a *ast.CallExpression) so a synthetic
+// compensation node, which has no source position, can drive it via its recovered
+// callsite span.
+func (i *Interp) invokeToolLive(node ast.Node, tool *object.Tool, args []object.Object) object.Object {
+	impl := tool.Impl
+	sig := impl.Signature()
+
+	// Arity: variadic tools accept any count; otherwise the call must match.
+	if !sig.Variadic && len(args) != len(sig.Params) {
+		return newError(node, diag.TypeArgCount,
+			"%s: wrong number of arguments: want %d, got %d", impl.Name(), len(sig.Params), len(args))
+	}
+
 	rev := impl.Reversibility()
 
 	// The base record shared by every outcome (allow/deny/error/ok). Filled in
 	// per outcome below. The callsite is the deterministic key the effect log
-	// (and, later, replay) uses instead of the scheduling-dependent Seq.
+	// (and replay) uses instead of the scheduling-dependent Seq.
 	rec := i.newRecord(node, impl.Name(), args, rev == object.Reversible)
 
 	// Policy gate (the shared pipeline llm() also uses): Deny is a learnable
@@ -942,8 +1085,8 @@ func (i *Interp) invokeTool(node *ast.CallExpression, tool *object.Tool, args []
 	if result == nil {
 		result = NULL
 	}
-	// Capture the inverse action for a successful reversible call so a later phase
-	// can roll it back (DESIGN.md §7). Capture only; firing is Phase 5.
+	// Capture the inverse action for a successful reversible call so rollback can
+	// later walk the log backward and fire it (DESIGN.md §7; see runtime/rollback).
 	if comp, ok := impl.(object.Compensator); ok {
 		if cTool, cArgs, ok := comp.Compensation(args, result); ok {
 			rec.Compensation = &effectlog.Compensation{Tool: cTool, Args: renderArgs(cArgs)}
@@ -1005,6 +1148,110 @@ func (i *Interp) gate(node ast.Node, rec effectlog.Record, name string, args []o
 		}
 	}
 	return nil
+}
+
+// --- deterministic replay (DESIGN.md §10) ---
+
+// replaying reports whether the run is in deterministic-replay mode.
+func (i *Interp) replaying() bool { return i.Replay != nil }
+
+// replayEffect serves a recorded outcome for an effect-producing primitive (a
+// tool, llm, or ask_human) instead of performing the side effect (DESIGN.md §10).
+// It is the single replay code path all three primitives share, mirroring how they
+// share the live effect pipeline, so the §10 key — (Branch, Callsite, Occurrence)
+// — is computed in exactly one place for every effect kind.
+//
+// Occurrence single-source: the occurrence is reserved from the SAME counter a live
+// run would use (effectlog.Recorder.Reserve, which advances the recorder's
+// per-(branch, callsite) counter), so the key this looks the record up by cannot
+// drift from the key the original run wrote. The reserved occurrence is then carried
+// onto the freshly appended record via AppendReserved, which stores without
+// re-advancing the counter — so the counter ticks exactly once per effect, just as
+// in a live run. Duplicating this counting anywhere else is exactly how replay drift
+// bugs arise; it lives only in the recorder.
+//
+// On a hit it reconstructs the recorded outcome (ok → the result lifted back into a
+// Cue value; error → a CUE_TOOL_* error; denied → the CUE_CAP_* error the original
+// policy decision produced) and appends a record to the live recorder so the replay
+// itself is observable in the envelope and a fresh log could be produced. On a miss
+// — the program was edited so this call site/occurrence no longer matches the log —
+// it returns a CUE_REPLAY_001 error naming the branch, callsite, and tool.
+//
+// It does NOT call Invoke / the provider / stdin, and it skips the policy gate: the
+// recorded record already reflects the original gate decision, so re-gating would be
+// both redundant and able to diverge from what was logged.
+func (i *Interp) replayEffect(node ast.Node, rec effectlog.Record) object.Object {
+	occ := i.Effects.Reserve(rec.Branch, rec.Callsite)
+	recorded, ok := i.Replay.Lookup(rec.Branch, rec.Callsite, occ)
+	if !ok {
+		return newError(node, diag.ReplayMismatch,
+			"no recorded effect for %s at branch %q callsite %s occurrence %d: "+
+				"the program no longer matches the log (a call site moved, was added, or runs more times)",
+			rec.Tool, branchOrRoot(rec.Branch), rec.Callsite, occ)
+	}
+
+	// Reuse the recorded record verbatim (status, result, error, compensation,
+	// reversible, …) but stamp it with THIS run's identity: the live tool name and
+	// args, and the reserved occurrence. AppendReserved keeps that occurrence and
+	// does not re-advance the counter (DESIGN.md §10).
+	replayed := recorded
+	replayed.Branch = rec.Branch
+	replayed.Callsite = rec.Callsite
+	replayed.Occurrence = occ
+	replayed.Tool = rec.Tool
+	replayed.Args = rec.Args
+	replayed.Ts = "" // re-stamped by the recorder so the fresh log reflects this run
+	replayed.Seq = 0
+	replayed.DurationMs = 0
+	i.Effects.AppendReserved(replayed)
+
+	return reconstructOutcome(node, recorded)
+}
+
+// reconstructOutcome turns a recorded effect record back into the runtime value (or
+// error) the primitive would have returned (DESIGN.md §10):
+//
+//	status "ok"     -> the recorded result lifted back into a Cue value
+//	status "error"  -> a CUE_TOOL_* error carrying the recorded message
+//	status "denied" -> a CUE_CAP_* error carrying the recorded policy reason
+//
+// A record with no status (or an unknown one) is treated as a replay mismatch
+// rather than silently succeeding.
+func reconstructOutcome(node ast.Node, rec effectlog.Record) object.Object {
+	switch rec.Status {
+	case "ok":
+		return object.FromAny(rec.Result)
+	case "error":
+		return newError(node, diag.ToolFailure, "%s", recordedMessage(rec))
+	case "denied":
+		// Preserve the capability code so the denial replays as the same boundary
+		// the agent originally hit. The recorded reason distinguishes an outright
+		// Deny (CUE_CAP_001) from a declined Prompt (CUE_CAP_002); both are CapDenied-
+		// family, and the message carries the specific reason. We default to
+		// CUE_CAP_001 since the log does not separately store the gate code.
+		return &object.Error{Code: diag.CapDenied, Message: recordedMessage(rec), Span: node.Span()}
+	default:
+		return newError(node, diag.ReplayMismatch,
+			"recorded effect for %s has unexpected status %q", rec.Tool, rec.Status)
+	}
+}
+
+// recordedMessage returns the recorded error/denial message, or a placeholder when
+// the log somehow carries none, so a reconstructed error always has a message.
+func recordedMessage(rec effectlog.Record) string {
+	if rec.Error != nil && *rec.Error != "" {
+		return *rec.Error
+	}
+	return rec.Tool + ": recorded failure"
+}
+
+// branchOrRoot renders an empty branch as "root" for diagnostics, matching the
+// recorder's default.
+func branchOrRoot(branch string) string {
+	if branch == "" {
+		return "root"
+	}
+	return branch
 }
 
 // recordError logs a failed call (status "error") and returns the matching

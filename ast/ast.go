@@ -346,6 +346,40 @@ func (pe *ParallelExpression) String() string {
 	return out.String()
 }
 
+// ParallelBranch is one named branch of a parallel block: `<Name> = <Value>`
+// (DESIGN.md §3, §6). Name binds the branch's result in the resulting Hash; Value is
+// the expression evaluated concurrently for that branch.
+type ParallelBranch struct {
+	Name  *Identifier
+	Value Expression
+}
+
+// ParallelBlockExpression is the parallel block form `parallel { a = exprA; b =
+// exprB }` (DESIGN.md §3, §6 — Form 2). Each Branch runs concurrently; the
+// expression evaluates to a Hash mapping each branch name to its result, in source
+// order. It is the sibling of ParallelExpression (the map form): same errgroup
+// machinery, different shape (named branches → a Hash, vs an iterable → an Array).
+// Like the map form it is an expression (it yields a value).
+type ParallelBlockExpression struct {
+	spanned
+	Token    token.Token // the 'parallel' token
+	Branches []ParallelBranch
+}
+
+func (pe *ParallelBlockExpression) expressionNode()      {}
+func (pe *ParallelBlockExpression) TokenLiteral() string { return pe.Token.Literal }
+func (pe *ParallelBlockExpression) String() string {
+	branches := make([]string, 0, len(pe.Branches))
+	for _, b := range pe.Branches {
+		val := ""
+		if b.Value != nil {
+			val = b.Value.String()
+		}
+		branches = append(branches, b.Name.String()+" = "+val)
+	}
+	return "parallel { " + strings.Join(branches, "; ") + " }"
+}
+
 // RetryExpression is `retry (<Attempts>) <Body>` (DESIGN.md §3, §8). Attempts is
 // the maximum number of tries (an expression that must evaluate to a positive
 // integer). Body is re-evaluated up to Attempts times while it yields an error;

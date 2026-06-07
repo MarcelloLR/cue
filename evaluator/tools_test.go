@@ -3,6 +3,7 @@ package evaluator
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,20 +16,26 @@ import (
 )
 
 // mockTool is a deterministic ToolImpl — it never touches the network, so tool
-// invocation can be tested end-to-end with stable output.
+// invocation can be tested end-to-end with stable output. invoked is an atomic
+// counter so a `parallel` body can invoke it from many goroutines under -race; read
+// it after the run completes with invokedCount.
 type mockTool struct {
 	name    string
 	sig     object.Signature
 	rev     object.Reversibility
 	fail    bool
-	invoked int
+	invoked atomic.Int64
 }
+
+// invokedCount returns how many times Invoke ran. It is the race-safe accessor for
+// the atomic counter, used by tests after a run (including parallel ones) finishes.
+func (m *mockTool) invokedCount() int64 { return m.invoked.Load() }
 
 func (m *mockTool) Name() string                        { return m.name }
 func (m *mockTool) Signature() object.Signature         { return m.sig }
 func (m *mockTool) Reversibility() object.Reversibility { return m.rev }
 func (m *mockTool) Invoke(ctx context.Context, args []object.Object) (object.Object, error) {
-	m.invoked++
+	m.invoked.Add(1)
 	if m.fail {
 		return nil, errors.New("boom")
 	}
@@ -180,7 +187,7 @@ func TestToolDeniedByPolicy(t *testing.T) {
 	if e.Code != "CUE_CAP_001" {
 		t.Errorf("code = %q, want CUE_CAP_001", e.Code)
 	}
-	if m.invoked != 0 {
+	if m.invokedCount() != 0 {
 		t.Errorf("denied tool should not be invoked")
 	}
 	// Phase 3: the blocked attempt is still recorded (status "denied") so the
@@ -246,8 +253,8 @@ func TestPromptAllowedByPrompter(t *testing.T) {
 	if _, ok := result.(*object.Hash); !ok {
 		t.Fatalf("an allow-prompter should let the call proceed, got %T (%s)", result, result.Inspect())
 	}
-	if m.invoked != 1 {
-		t.Errorf("confirmed tool should be invoked once, got %d", m.invoked)
+	if m.invokedCount() != 1 {
+		t.Errorf("confirmed tool should be invoked once, got %d", m.invokedCount())
 	}
 	if len(effects) != 1 || effects[0].Status != "ok" {
 		t.Fatalf("confirmed call should log one ok effect, got %+v", effects)
@@ -266,7 +273,7 @@ func TestPromptDeniedByDefaultPrompter(t *testing.T) {
 	if e.Code != "CUE_CAP_002" {
 		t.Errorf("code = %q, want CUE_CAP_002", e.Code)
 	}
-	if m.invoked != 0 {
+	if m.invokedCount() != 0 {
 		t.Errorf("an unconfirmed tool must not be invoked")
 	}
 	if len(effects) != 1 || effects[0].Status != "denied" {
@@ -285,7 +292,7 @@ func TestPromptDeclinedByPrompter(t *testing.T) {
 	if e.Code != "CUE_CAP_002" {
 		t.Errorf("code = %q, want CUE_CAP_002", e.Code)
 	}
-	if m.invoked != 0 {
+	if m.invokedCount() != 0 {
 		t.Errorf("a declined tool must not be invoked")
 	}
 }

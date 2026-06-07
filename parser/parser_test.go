@@ -120,6 +120,69 @@ func TestParallelParses(t *testing.T) {
 	}
 }
 
+func TestParallelBlockParses(t *testing.T) {
+	cases := []struct {
+		input string
+		want  string
+	}{
+		// Single and multiple branches; the String() form joins branches with "; ".
+		{"parallel { a = f() }", "parallel { a = f() }"},
+		{"parallel { a = f(); b = g() }", "parallel { a = f(); b = g() }"},
+		// Newline-separated branches: the lexer's terminator rule inserts the ';'
+		// after each value (DESIGN.md §2), so no explicit separator is needed.
+		{"parallel {\n  a = f()\n  b = g()\n}", "parallel { a = f(); b = g() }"},
+		// Branch values are arbitrary expressions, including tool calls and arithmetic.
+		{"parallel { x = 1 + 2; y = ns.tool(z) }", "parallel { x = (1 + 2); y = (ns.tool)(z) }"},
+		// A trailing terminator before '}' is tolerated.
+		{"parallel { a = f();\n }", "parallel { a = f() }"},
+	}
+	for _, c := range cases {
+		if got := parse(t, c.input); got != c.want {
+			t.Errorf("parse(%q) = %q, want %q", c.input, got, c.want)
+		}
+	}
+}
+
+func TestParallelBlockMalformedYieldsDiagnostic(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+	}{
+		{"branch not name=expr", "parallel { f() }"},
+		{"branch missing equals", "parallel { a f() }"},
+		{"branch missing value", "parallel { a = }"},
+		{"non-ident branch name", "parallel { 1 = f() }"},
+		{"unclosed block", "parallel { a = f()"},
+		{"neither paren nor brace", "parallel 42"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := New(lexer.New(c.src))
+			p.ParseProgram()
+			if !p.HasErrors() {
+				t.Fatalf("expected a diagnostic for %q", c.src)
+			}
+			for _, d := range p.Diagnostics() {
+				if d.Span.Start.Line == 0 {
+					t.Errorf("diagnostic %q missing span", d.Code)
+				}
+			}
+		})
+	}
+}
+
+// TestParallelBlockReportsEveryMalformedBranch confirms error recovery: a block with
+// two bad branches reports two diagnostics, not just the first (DESIGN.md §9).
+func TestParallelBlockReportsEveryMalformedBranch(t *testing.T) {
+	const src = "parallel { f(); g() }"
+	p := New(lexer.New(src))
+	p.ParseProgram()
+	diags := p.Diagnostics()
+	if len(diags) < 2 {
+		t.Fatalf("expected a diagnostic per malformed branch (>=2), got %d: %+v", len(diags), diags)
+	}
+}
+
 func TestRetryParses(t *testing.T) {
 	cases := []struct {
 		input string
