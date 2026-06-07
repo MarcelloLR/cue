@@ -8,6 +8,9 @@
 *.so
 *.dylib
 
+# Built `cue` interpreter binary (produced by `go build -o cue ./cmd/cue`)
+/cue
+
 # Test binary, built with `go test -c`
 *.test
 
