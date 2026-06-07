@@ -72,13 +72,48 @@ func Load(path string) (*Source, error) {
 
 // Read indexes a JSONL effect log streamed from r into a Source. It is the
 // io.Reader-based core of Load, exposed so tests (and a harness) can replay from an
-// in-memory log without touching disk. Blank lines are skipped; a malformed line is
-// a hard error so a corrupt log fails loudly rather than silently dropping effects.
+// in-memory log without touching disk. It decodes the records via ReadRecords (the
+// shared parsing core) and then indexes them by key; blank lines are skipped and a
+// malformed line is a hard error so a corrupt log fails loudly rather than silently
+// dropping effects.
 func Read(r io.Reader) (*Source, error) {
-	src := &Source{byKey: map[string]effectlog.Record{}}
+	recs, err := ReadRecords(r)
+	if err != nil {
+		return nil, err
+	}
+	src := &Source{byKey: make(map[string]effectlog.Record, len(recs))}
+	for _, rec := range recs {
+		// Last write wins if a (branch, callsite, occurrence) repeats — a single
+		// run never produces duplicates, but appending two runs to one log file
+		// would, and replaying the most recent is the least surprising behaviour.
+		src.byKey[key(rec.Branch, rec.Callsite, rec.Occurrence)] = rec
+	}
+	return src, nil
+}
+
+// LoadRecords reads a JSONL effect log from path into the ordered slice of records it
+// contains, preserving append (seq) order. It shares the exact line-parsing core that
+// Load uses (Read → ReadRecords), so a log that loads for replay also loads for
+// rollback. Rollback needs the records in order — to walk them backward — rather than
+// indexed by key, which is why this returns the slice and Load returns the Source.
+func LoadRecords(path string) ([]effectlog.Record, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("replay: open log: %w", err)
+	}
+	defer f.Close()
+	return ReadRecords(f)
+}
+
+// ReadRecords decodes a JSONL effect log streamed from r into the ordered slice of
+// records it contains, in append order. It is the io.Reader-based core LoadRecords and
+// Read share (Read indexes the same records by key), so the JSONL parsing — UseNumber,
+// the raised line cap, blank-line skipping, and the hard error on a malformed line —
+// lives in exactly one place. Exposed so tests (and a harness) can drive rollback from
+// an in-memory log without disk.
+func ReadRecords(r io.Reader) ([]effectlog.Record, error) {
+	var out []effectlog.Record
 	sc := bufio.NewScanner(r)
-	// Effect-log lines can be long (large tool results); raise the line cap well
-	// above bufio's default 64 KiB so a big record does not truncate.
 	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 	line := 0
 	for sc.Scan() {
@@ -93,15 +128,12 @@ func Read(r io.Reader) (*Source, error) {
 		if err := dec.Decode(&rec); err != nil {
 			return nil, fmt.Errorf("replay: log line %d is not a valid effect record: %w", line, err)
 		}
-		// Last write wins if a (branch, callsite, occurrence) repeats — a single
-		// run never produces duplicates, but appending two runs to one log file
-		// would, and replaying the most recent is the least surprising behaviour.
-		src.byKey[key(rec.Branch, rec.Callsite, rec.Occurrence)] = rec
+		out = append(out, rec)
 	}
 	if err := sc.Err(); err != nil {
 		return nil, fmt.Errorf("replay: read log: %w", err)
 	}
-	return src, nil
+	return out, nil
 }
 
 // Lookup returns the recorded outcome for a (branch, callsite, occurrence) key and

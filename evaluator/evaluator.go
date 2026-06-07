@@ -933,21 +933,44 @@ func (i *Interp) invokeTool(node *ast.CallExpression, tool *object.Tool, args []
 			"%s: wrong number of arguments: want %d, got %d", impl.Name(), len(sig.Params), len(args))
 	}
 
-	rev := impl.Reversibility()
-
-	// The base record shared by every outcome (allow/deny/error/ok). Filled in
-	// per outcome below. The callsite is the deterministic key the effect log
-	// (and replay) uses instead of the scheduling-dependent Seq.
-	rec := i.newRecord(node, impl.Name(), args, rev == object.Reversible)
-
 	// Deterministic replay (DESIGN.md §10): serve the recorded outcome and skip the
 	// gate + Invoke entirely. The recorded record already reflects the original gate
 	// decision and tool result, so the call reproduces without touching the outside
 	// world. Arity is still checked above because a wrong-arity call is a program
 	// error in any mode.
 	if i.replaying() {
+		rev := impl.Reversibility()
+		rec := i.newRecord(node, impl.Name(), args, rev == object.Reversible)
 		return i.replayEffect(node, rec)
 	}
+
+	return i.invokeToolLive(node, tool, args)
+}
+
+// invokeToolLive runs the live half of the tool pipeline — arity check → policy
+// gate → effect-log the call → Invoke → log the result/error/compensation → return
+// (DESIGN.md §7) — shared by a source-level tool call (after its replay short-circuit)
+// and by rollback firing a captured compensation (InvokeCompensation). Keeping it one
+// method is why a compensation is gated, recorded, and coded exactly like any other
+// tool call. It takes an ast.Node (not a *ast.CallExpression) so a synthetic
+// compensation node, which has no source position, can drive it via its recovered
+// callsite span.
+func (i *Interp) invokeToolLive(node ast.Node, tool *object.Tool, args []object.Object) object.Object {
+	impl := tool.Impl
+	sig := impl.Signature()
+
+	// Arity: variadic tools accept any count; otherwise the call must match.
+	if !sig.Variadic && len(args) != len(sig.Params) {
+		return newError(node, diag.TypeArgCount,
+			"%s: wrong number of arguments: want %d, got %d", impl.Name(), len(sig.Params), len(args))
+	}
+
+	rev := impl.Reversibility()
+
+	// The base record shared by every outcome (allow/deny/error/ok). Filled in
+	// per outcome below. The callsite is the deterministic key the effect log
+	// (and replay) uses instead of the scheduling-dependent Seq.
+	rec := i.newRecord(node, impl.Name(), args, rev == object.Reversible)
 
 	// Policy gate (the shared pipeline llm() also uses): Deny is a learnable
 	// boundary (CUE_CAP_001); Prompt routes through the Prompter seam (CUE_CAP_002
@@ -968,8 +991,8 @@ func (i *Interp) invokeTool(node *ast.CallExpression, tool *object.Tool, args []
 	if result == nil {
 		result = NULL
 	}
-	// Capture the inverse action for a successful reversible call so a later phase
-	// can roll it back (DESIGN.md §7). Capture only; firing is Phase 5.
+	// Capture the inverse action for a successful reversible call so rollback can
+	// later walk the log backward and fire it (DESIGN.md §7; see runtime/rollback).
 	if comp, ok := impl.(object.Compensator); ok {
 		if cTool, cArgs, ok := comp.Compensation(args, result); ok {
 			rec.Compensation = &effectlog.Compensation{Tool: cTool, Args: renderArgs(cArgs)}
