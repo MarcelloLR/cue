@@ -97,6 +97,20 @@ type Recorder struct {
 	// (DESIGN.md §7 durable JSONL). Writes happen under mu so the stream stays in
 	// append order and goroutine-safe.
 	sink io.Writer
+	// sinks receive each appended record via WriteRecord, for storage backends
+	// richer than line-oriented JSONL (e.g. the SQLite "queryable upgrade",
+	// DESIGN.md §7). Like the JSONL sink they are driven under mu, in append order.
+	sinks []Sink
+}
+
+// Sink receives each record as it is appended, for durable or queryable storage
+// beyond the in-memory ledger (DESIGN.md §7). The SQLite backend is a Sink. Because
+// the Recorder calls WriteRecord under its lock and in append order, implementations
+// need no locking of their own. A returned error is swallowed by the Recorder (the
+// audit log is a side-channel and must never break a user program), so a Sink that
+// wants to surface failures should do so out-of-band.
+type Sink interface {
+	WriteRecord(Record) error
 }
 
 // NewRecorder returns an empty Recorder with the default wall-clock.
@@ -113,6 +127,16 @@ func (r *Recorder) SetSink(w io.Writer) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.sink = w
+}
+
+// AddSink registers a Sink to receive every subsequently appended record. It is
+// the seam the SQLite backend (`cue run --sqlite <path>`) wires in, alongside or
+// instead of the JSONL sink. Records already appended are not back-filled; call it
+// before recording begins.
+func (r *Recorder) AddSink(s Sink) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.sinks = append(r.sinks, s)
 }
 
 // occKey builds the per-(branch, callsite) counter key. Branch is normalised to
@@ -204,15 +228,17 @@ func (r *Recorder) store(rec Record) int {
 // panic) a user program — the in-memory Records() still carry the truth for the
 // envelope (DESIGN.md §7, §9).
 func (r *Recorder) writeSink(rec Record) {
-	if r.sink == nil {
-		return
+	if r.sink != nil {
+		if line, err := json.Marshal(rec); err == nil {
+			line = append(line, '\n')
+			_, _ = r.sink.Write(line)
+		}
 	}
-	line, err := json.Marshal(rec)
-	if err != nil {
-		return
+	// Richer sinks (e.g. SQLite) receive the record as-is. Errors are swallowed for
+	// the same reason JSONL write errors are: the audit log must not break the run.
+	for _, s := range r.sinks {
+		_ = s.WriteRecord(rec)
 	}
-	line = append(line, '\n')
-	_, _ = r.sink.Write(line)
 }
 
 // Records returns a copy of the recorded entries in append order.

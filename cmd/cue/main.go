@@ -1,8 +1,9 @@
 // Command cue is the Cue interpreter CLI (DESIGN.md §11).
 //
-//	cue run <file.cue> [--json] [--log <path>] [--policy <path>]
+//	cue run <file.cue> [--json] [--log <path>] [--sqlite <path>] [--policy <path>]
 //	                                parse and execute a program; --log streams the
-//	                                effect log as JSONL, --policy gates tool calls
+//	                                effect log as JSONL, --sqlite also writes it to a
+//	                                queryable SQLite db, --policy gates tool calls
 //	cue check <file.cue> [--json]   static checks only, no execution
 //	cue catalog [--json]            available tools + grammar (the agent prompt)
 //	cue replay <log> <file.cue> [--json]
@@ -42,6 +43,7 @@ import (
 	"github.com/MarcelloLR/cue/runtime/registry"
 	"github.com/MarcelloLR/cue/runtime/replay"
 	"github.com/MarcelloLR/cue/runtime/rollback"
+	"github.com/MarcelloLR/cue/runtime/sqlitelog"
 	"github.com/MarcelloLR/cue/runtime/tools"
 )
 
@@ -121,13 +123,18 @@ func popValueFlag(args []string, name string) (rest []string, value string, pres
 func cmdRun(args []string) int {
 	args, asJSON := popFlag(args, "--json")
 	args, logPath, hasLog := popValueFlag(args, "--log")
+	args, dbPath, hasDB := popValueFlag(args, "--sqlite")
 	pos, policyPath, hasPolicy := popValueFlag(args, "--policy")
 	if len(pos) < 1 {
-		fmt.Fprintln(os.Stderr, "usage: cue run <file.cue> [--json] [--log <path>] [--policy <path>]")
+		fmt.Fprintln(os.Stderr, "usage: cue run <file.cue> [--json] [--log <path>] [--sqlite <path>] [--policy <path>]")
 		return 2
 	}
 	if hasLog && logPath == "" {
 		fmt.Fprintln(os.Stderr, "cue: --log requires a path")
+		return 2
+	}
+	if hasDB && dbPath == "" {
+		fmt.Fprintln(os.Stderr, "cue: --sqlite requires a path")
 		return 2
 	}
 	if hasPolicy && policyPath == "" {
@@ -183,6 +190,17 @@ func cmdRun(args []string) int {
 		}
 		defer logFile.Close()
 		effects.SetSink(logFile)
+	}
+	// --sqlite adds the queryable SQLite backend alongside (or instead of) JSONL: the
+	// same records also land in an `effects` table for SQL access (DESIGN.md §7).
+	if hasDB {
+		dbSink, err := sqlitelog.Open(dbPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "cue: --sqlite: %v\n", err)
+			return 1
+		}
+		defer dbSink.Close()
+		effects.AddSink(dbSink)
 	}
 
 	opts := []evaluator.Option{
