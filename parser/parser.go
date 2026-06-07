@@ -403,13 +403,33 @@ func (p *Parser) parseForExpression() ast.Expression {
 	return fe
 }
 
-// parseParallelExpression parses the parallel map form
+// parseParallelExpression dispatches on the token right after `parallel` to choose
+// between the two grammar forms (DESIGN.md §3, §6):
+//
+//	parallel ( IDENT in EXPR [ , limit = EXPR ] ) BLOCK   — map form (Form 1)
+//	parallel { IDENT = EXPR ; ... }                        — block form (Form 2)
+//
+// A '(' opens the map form; a '{' opens the block form. Anything else is a parse
+// error naming both shapes so the agent can self-repair.
+func (p *Parser) parseParallelExpression() ast.Expression {
+	switch p.peek.Type {
+	case token.LPAREN:
+		return p.parseParallelMap()
+	case token.LBRACE:
+		return p.parseParallelBlock()
+	default:
+		p.diags.Error(diag.ParseUnexpectedToken, p.peek.Span,
+			"expected `(` (parallel map) or `{` (parallel block) after `parallel`, found %q", p.peek.Literal)
+		return nil
+	}
+}
+
+// parseParallelMap parses the parallel map form
 // `parallel ( IDENT in EXPR [ , limit = EXPR ] ) BLOCK` (DESIGN.md §3, §6).
 // The leading '(' opens the lexer's paren-depth, so newlines inside the head are
 // line continuations. The optional `limit = EXPR` caps concurrency; absent, the
-// evaluator's default limit applies. The block form (`parallel BLOCK`) is
-// phase-later and is not parsed here.
-func (p *Parser) parseParallelExpression() ast.Expression {
+// evaluator's default limit applies.
+func (p *Parser) parseParallelMap() ast.Expression {
 	start := p.cur
 	pe := &ast.ParallelExpression{Token: start}
 	if !p.expectPeek(token.LPAREN) {
@@ -450,6 +470,74 @@ func (p *Parser) parseParallelExpression() ast.Expression {
 	pe.Body = p.parseBlockStatement()
 	pe.Sp = p.spanFrom(start)
 	return pe
+}
+
+// parseParallelBlock parses the parallel block form
+// `parallel { IDENT = EXPR ; ... }` (DESIGN.md §3, §6 — Form 2). Each statement in
+// the block is a named branch binding: an identifier, `=`, and an expression. The
+// newline/`;` terminator rules the lexer already applies separate the branches, just
+// as they separate ordinary statements. A statement that is not `ident = expr` is a
+// parse error (CUE_PARSE_*) naming the expected shape, recovering at the next branch
+// so one pass reports every malformed branch.
+func (p *Parser) parseParallelBlock() ast.Expression {
+	start := p.cur // the 'parallel' token
+	pe := &ast.ParallelBlockExpression{Token: start}
+	if !p.expectPeek(token.LBRACE) {
+		return nil
+	}
+	p.nextToken() // move past '{' to the first branch (or '}')
+	for p.cur.Type != token.RBRACE && p.cur.Type != token.EOF {
+		// Skip blank statements (a leading newline after '{' or a bare ';').
+		if p.cur.Type == token.SEMICOLON {
+			p.nextToken()
+			continue
+		}
+		if branch, ok := p.parseParallelBranch(); ok {
+			pe.Branches = append(pe.Branches, branch)
+		}
+		p.nextToken()
+	}
+	if p.cur.Type != token.RBRACE {
+		p.diags.Error(diag.ParseUnexpectedToken, p.cur.Span, "expected }, found %q", p.cur.Literal)
+	}
+	pe.Sp = token.Span{Start: start.Span.Start, End: p.cur.Span.End}
+	return pe
+}
+
+// parseParallelBranch parses one `IDENT = EXPR` branch binding. It returns the branch
+// and true on success; on a malformed branch it records a diagnostic, advances to the
+// next statement terminator so the loop can recover at the next branch, and returns
+// false. cur must be the branch's first token on entry; on a successful return cur is
+// the last token of the branch's value expression.
+func (p *Parser) parseParallelBranch() (ast.ParallelBranch, bool) {
+	if p.cur.Type != token.IDENT {
+		p.diags.Error(diag.ParseUnexpectedToken, p.cur.Span,
+			"parallel block branch must be `name = expr`, found %q", p.cur.Literal)
+		p.recoverToBranchEnd()
+		return ast.ParallelBranch{}, false
+	}
+	name := &ast.Identifier{Token: p.cur, Value: p.cur.Literal}
+	name.Sp = p.cur.Span
+	if !p.expectPeek(token.ASSIGN) {
+		p.recoverToBranchEnd()
+		return ast.ParallelBranch{}, false
+	}
+	p.nextToken() // move to the first token of the value expression
+	value := p.parseExpression(LOWEST)
+	if value == nil {
+		p.recoverToBranchEnd()
+		return ast.ParallelBranch{}, false
+	}
+	return ast.ParallelBranch{Name: name, Value: value}, true
+}
+
+// recoverToBranchEnd advances to the next statement terminator (';'/newline) or the
+// block's closing '}' so the branch loop resumes cleanly at the next branch after a
+// malformed one — the error-recovery the diagnostics pillar relies on (DESIGN.md §9).
+func (p *Parser) recoverToBranchEnd() {
+	for p.peek.Type != token.SEMICOLON && p.peek.Type != token.RBRACE && p.peek.Type != token.EOF {
+		p.nextToken()
+	}
 }
 
 // parseRetryExpression parses the retry form `retry ( EXPR ) BLOCK` (DESIGN.md

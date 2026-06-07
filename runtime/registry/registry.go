@@ -109,6 +109,7 @@ type Catalog struct {
 const grammarSummary = "let x = expr | x = expr | fn(a, b) { ... } | " +
 	"if cond { ... } else { ... } | for x in xs { ... } | " +
 	"parallel (x in xs[, limit = n]) { ... } | " +
+	"parallel { a = exprA; b = exprB } | " +
 	"retry (n) { ... } | ns.tool(args) | llm(prompt[, opts]) | " +
 	"ask_human(prompt) | [a, b] | {\"k\": v} | a.b | a[i] | // comment"
 

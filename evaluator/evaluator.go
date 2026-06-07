@@ -316,6 +316,8 @@ func (i *Interp) Eval(node ast.Node, env *object.Environment) object.Object {
 		return i.evalForExpression(node, env)
 	case *ast.ParallelExpression:
 		return i.evalParallelExpression(node, env)
+	case *ast.ParallelBlockExpression:
+		return i.evalParallelBlockExpression(node, env)
 	case *ast.RetryExpression:
 		return i.evalRetryExpression(node, env)
 	case *ast.CallExpression:
@@ -706,25 +708,11 @@ func (i *Interp) evalParallelExpression(node *ast.ParallelExpression, env *objec
 			branchEnv := object.NewEnclosedEnvironment(env)
 			branchEnv.Set(node.Var.Value, item)
 
-			child := &Interp{
-				Ctx:      gctx,
-				Policy:   i.Policy,
-				Prompter: i.Prompter,
-				Effects:  i.Effects,
-				Branch:   i.branchLabel(k),
-				Out:      i.Out,
-				// In, LLM, and promptLock are shared by reference across siblings:
-				// the same *sync.Mutex serializes every branch's human-prompt
-				// critical section so concurrent ask_human calls (and interactive
-				// policy prompts) never interleave on stdin (DESIGN.md §6).
-				In:         i.In,
-				LLM:        i.LLM,
-				promptLock: i.promptLock,
-				// Replay is shared by reference: a Source is immutable and safe for
-				// concurrent lookup, and replay keys on the branch label this child
-				// carries, so each branch resolves its own recorded effects (§10).
-				Replay: i.Replay,
-			}
+			// The child Interp shares the goroutine-safe Effects recorder, the policy,
+			// and the prompt channel by reference (see parallelChild); it runs under the
+			// errgroup context so a sibling error cancels it, and carries this branch's
+			// label for effect tagging and replay keying (DESIGN.md §6, §10).
+			child := i.parallelChild(gctx, i.branchLabel(k))
 
 			result := child.Eval(node.Body, branchEnv)
 			if e, ok := result.(*object.Error); ok {
@@ -753,6 +741,76 @@ func (i *Interp) evalParallelExpression(node *ast.ParallelExpression, env *objec
 	return &object.Array{Elements: results}
 }
 
+// evalParallelBlockExpression runs the parallel block form (DESIGN.md §3, §6 — Form
+// 2): `parallel { a = exprA; b = exprB }`. Each named branch's value expression is
+// evaluated concurrently on the SAME errgroup + shared-context machinery the map form
+// uses (bounded by DefaultParallelLimit), and the expression evaluates to a Hash
+// mapping each branch name to its result, IN SOURCE ORDER regardless of completion
+// order. The first branch to yield an *object.Error returns it as a Go error, which
+// cancels the shared context (errgroup semantics) and becomes the expression's value.
+//
+// Each branch gets its own enclosed environment and its own child Interp (sharing only
+// the goroutine-safe Effects recorder, the Policy/Prompter, In/LLM/promptLock, and the
+// immutable Replay Source — exactly like the map form), so no writable state is shared
+// across goroutines. The branch label is "parallel:<name>" (nested under any parent
+// branch), so effects from inside a block branch key on (branch, callsite, occurrence)
+// just as the map form's do — which is why replay works unchanged under the block form.
+//
+// The branch bindings do NOT leak into the outer scope: the Hash IS the result. Source
+// order is preserved by writing each branch's result into a pre-sized slice at its
+// declaration index, then assembling the Hash from that slice in order after Wait.
+func (i *Interp) evalParallelBlockExpression(node *ast.ParallelBlockExpression, env *object.Environment) object.Object {
+	n := len(node.Branches)
+	results := make([]object.Object, n)
+
+	g, gctx := errgroup.WithContext(i.Ctx)
+	g.SetLimit(DefaultParallelLimit)
+
+	for k := 0; k < n; k++ {
+		k, branch := k, node.Branches[k]
+		g.Go(func() error {
+			// Each branch evaluates in its own enclosed env (so a `let` inside it does
+			// not leak), under a child Interp that shares the goroutine-safe Effects
+			// recorder and runs on the errgroup's context so a sibling error cancels it.
+			// The branch label "parallel:<name>" tags every effect (DESIGN.md §6).
+			branchEnv := object.NewEnclosedEnvironment(env)
+			child := i.parallelChild(gctx, i.namedBranchLabel(branch.Name.Value))
+
+			result := child.Eval(branch.Value, branchEnv)
+			if e, ok := result.(*object.Error); ok {
+				// Surface as a Go error so errgroup cancels the rest via gctx; the
+				// *object.Error is recovered after Wait.
+				return &branchError{err: e}
+			}
+			// A `return` inside a branch value unwinds to its value, mirroring the map
+			// form and a function body (DESIGN.md §5).
+			if rv, ok := result.(*object.ReturnValue); ok {
+				result = rv.Value
+			}
+			results[k] = result
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		if be, ok := err.(*branchError); ok {
+			return be.err
+		}
+		// errgroup only ever sees branchError values from our g.Go closures, so this
+		// is unreachable; report defensively rather than panic.
+		return newError(node, diag.RuntimeBuiltin, "parallel: %s", err.Error())
+	}
+
+	// Assemble the result Hash in source (declaration) order. A duplicate branch name
+	// keeps the last write (Hash.Set semantics), but its key stays at first-seen
+	// position, matching how a hash literal with repeated keys behaves.
+	hash := object.NewHash()
+	for k, branch := range node.Branches {
+		hash.Set(branch.Name.Value, results[k])
+	}
+	return hash
+}
+
 // branchError carries an *object.Error out of a parallel branch as a Go error so
 // errgroup can use it to cancel siblings; evalParallelExpression unwraps the
 // first one back into the expression's value.
@@ -760,12 +818,48 @@ type branchError struct{ err *object.Error }
 
 func (b *branchError) Error() string { return b.err.Message }
 
-// branchLabel builds the branch path for the k-th parallel branch. At the top
-// level it is "parallel:k"; nested inside another branch it is
-// "<parent>/parallel:k" so the full concurrency path stays reconstructable
-// (DESIGN.md §6, §10).
+// parallelChild builds the child Interp a single parallel branch (map or block) runs
+// under: it shares the goroutine-safe Effects recorder, the Policy/Prompter, the
+// In/LLM/promptLock prompt channel (one *sync.Mutex serializes every branch's
+// human-prompt critical section so concurrent ask_human/confirm never interleave on
+// stdin, §6), and the immutable Replay Source — all by reference — while carrying the
+// errgroup context (so a sibling error cancels it) and this branch's label for effect
+// tagging (DESIGN.md §6, §10). Factoring it keeps the map and block forms building
+// identical child state from one place.
+func (i *Interp) parallelChild(gctx context.Context, branch string) *Interp {
+	return &Interp{
+		Ctx:        gctx,
+		Policy:     i.Policy,
+		Prompter:   i.Prompter,
+		Effects:    i.Effects,
+		Branch:     branch,
+		Out:        i.Out,
+		In:         i.In,
+		LLM:        i.LLM,
+		promptLock: i.promptLock,
+		Replay:     i.Replay,
+	}
+}
+
+// branchLabel builds the branch path for the k-th parallel map branch: "parallel:k"
+// at the top level, "<parent>/parallel:k" nested inside another branch so the full
+// concurrency path stays reconstructable (DESIGN.md §6, §10).
 func (i *Interp) branchLabel(k int) string {
-	label := fmt.Sprintf("parallel:%d", k)
+	return i.nestBranch(fmt.Sprintf("parallel:%d", k))
+}
+
+// namedBranchLabel builds the branch path for a parallel BLOCK branch: "parallel:name"
+// (nested under any parent branch). The block form keys effects exactly as the map form
+// does — only the leaf segment differs (a name instead of an index) — so replay works
+// unchanged under the block form (DESIGN.md §6, §10).
+func (i *Interp) namedBranchLabel(name string) string {
+	return i.nestBranch("parallel:" + name)
+}
+
+// nestBranch prefixes a leaf branch segment with this Interp's branch path when it is
+// itself inside a parallel branch, so nested parallels build a full path like
+// "parallel:0/parallel:b" (DESIGN.md §6, §10).
+func (i *Interp) nestBranch(label string) string {
 	if i.Branch != "" && i.Branch != "root" {
 		return i.Branch + "/" + label
 	}

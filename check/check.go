@@ -143,6 +143,14 @@ func (c *checker) checkExpr(expr ast.Expression, sc *scope) {
 		inner := newScope(sc)
 		inner.define(e.Var.Value)
 		c.checkStatement(e.Body, inner)
+	case *ast.ParallelBlockExpression:
+		// Each branch value is checked in the enclosing scope: a branch binding names a
+		// key in the result Hash, it does NOT introduce a scope binding (the branches do
+		// not see one another, and the names do not leak outward), so there is nothing to
+		// define here (DESIGN.md §6).
+		for _, b := range e.Branches {
+			c.checkExpr(b.Value, sc)
+		}
 	case *ast.RetryExpression:
 		c.checkExpr(e.Attempts, sc)
 		c.checkStatement(e.Body, newScope(sc))
