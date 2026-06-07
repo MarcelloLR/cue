@@ -24,6 +24,33 @@ var builtins = map[string]*object.Builtin{
 	"range": {Name: "range", Fn: builtinRange},
 }
 
+// builtinArities maps each builtin to its fixed argument count, or -1 when it is
+// variadic (no static arity check). The static checker (package check) reads this
+// so the builtin surface is described in exactly one place.
+var builtinArities = map[string]int{
+	"len":   1,
+	"print": -1, // variadic
+	"type":  1,
+	"str":   1,
+	"first": 1,
+	"last":  1,
+	"rest":  1,
+	"push":  2,
+	"keys":  1,
+	"range": 1,
+}
+
+// BuiltinArities returns a copy of the builtin name→arity table (arity -1 means
+// variadic). It exists so the static checker can validate builtin calls without
+// duplicating the list that lives next to the implementations.
+func BuiltinArities() map[string]int {
+	out := make(map[string]int, len(builtinArities))
+	for k, v := range builtinArities {
+		out[k] = v
+	}
+	return out
+}
+
 func berr(format string, args ...any) *object.Error {
 	return &object.Error{Code: diag.RuntimeBuiltin, Message: fmt.Sprintf(format, args...)}
 }

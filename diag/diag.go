@@ -32,8 +32,10 @@ const (
 	ParseInvalidAssign   = "CUE_PARSE_003"
 	ParseInvalidNumber   = "CUE_PARSE_004"
 
-	// Name resolution (runtime).
-	NameUnknownIdent = "CUE_NAME_001"
+	// Name resolution (runtime + static check).
+	NameUnknownIdent  = "CUE_NAME_001" // unbound identifier
+	NameUnknownTool   = "CUE_NAME_002" // member access on a non-namespace value
+	NameUnknownMember = "CUE_NAME_003" // unknown member on a known namespace
 
 	// Type / value errors (runtime).
 	TypeMismatch     = "CUE_TYPE_001"
@@ -43,18 +45,29 @@ const (
 	TypeNotIterable  = "CUE_TYPE_005"
 	TypeBadKey       = "CUE_TYPE_006"
 
+	// Capability / policy gating.
+	CapDenied = "CUE_CAP_001"
+
+	// Tool invocation failures (the tool's Invoke returned a Go error).
+	ToolFailure = "CUE_TOOL_001"
+
 	// Generic runtime errors.
 	RuntimeDivByZero = "CUE_RUNTIME_001"
 	RuntimeBuiltin   = "CUE_RUNTIME_002"
 )
 
-// Diagnostic is a single structured report about the program.
+// Diagnostic is a single structured report about the program. It is the unit of
+// the agent contract (DESIGN.md §9): a stable Code, the source Span, a Message,
+// and optional self-repair affordances (Snippet of the offending source, a Hint,
+// and machine-readable Data such as a did-you-mean suggestion).
 type Diagnostic struct {
 	Code     string
 	Severity Severity
 	Message  string
 	Span     token.Span
+	Snippet  string
 	Hint     string
+	Data     map[string]any
 }
 
 // Collector accumulates diagnostics so a single pass can report many problems

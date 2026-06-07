@@ -3,6 +3,7 @@
 package object
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 	"strings"
@@ -26,6 +27,8 @@ const (
 	BUILTIN_OBJ      ObjectType = "BUILTIN"
 	ARRAY_OBJ        ObjectType = "ARRAY"
 	HASH_OBJ         ObjectType = "HASH"
+	NAMESPACE_OBJ    ObjectType = "NAMESPACE"
+	TOOL_OBJ         ObjectType = "TOOL"
 )
 
 // Object is the interface all Cue runtime values implement.
@@ -160,4 +163,102 @@ func inspectElem(o Object) string {
 		return strconv.Quote(s.Value)
 	}
 	return o.Inspect()
+}
+
+// --- Tool & namespace values (DESIGN.md §4, §7) ---
+//
+// Tools are the only way a Cue program touches the outside world; member access
+// on a Namespace (e.g. `http.get`) resolves to a Tool, and calling a Tool routes
+// through the runtime's gating + logging pipeline. The concrete tool registry
+// and implementations live in higher packages (runtime/*); to keep object free
+// of an import cycle, object only declares the ToolImpl *interface* those
+// packages satisfy. object is allowed to depend on the stdlib context so an
+// Invoke can honour cancellation and timeouts.
+
+// Reversibility classifies whether a tool's effect can be undone, which the
+// effect log records so a later phase can compensate/roll back (DESIGN.md §7).
+type Reversibility string
+
+const (
+	Reversible           Reversibility = "reversible"
+	Irreversible         Reversibility = "irreversible"
+	ReversibilityUnknown Reversibility = "unknown"
+)
+
+// Param describes one positional parameter of a tool. Type is a human/catalog
+// hint only — Cue is dynamically typed, so arguments are not statically checked
+// against it (DESIGN.md §4).
+type Param struct {
+	Name string
+	Type string
+}
+
+// Signature is a tool's parameter list. Variadic tools accept any arg count and
+// are therefore exempt from arity checking.
+type Signature struct {
+	Params   []Param
+	Variadic bool
+}
+
+// ToolImpl is the Go-side contract a concrete tool satisfies (DESIGN.md §7). It
+// lives in object (not runtime/registry) so that object.Tool can wrap it without
+// object importing runtime/* — which would be an import cycle.
+type ToolImpl interface {
+	Name() string // namespaced, e.g. "http.get"
+	Signature() Signature
+	Reversibility() Reversibility
+	Invoke(ctx context.Context, args []Object) (Object, error)
+}
+
+// Tool is a callable runtime value wrapping a registered ToolImpl. Applying it
+// runs the invocation pipeline (policy check → effect log → Invoke).
+type Tool struct{ Impl ToolImpl }
+
+func (t *Tool) Type() ObjectType { return TOOL_OBJ }
+func (t *Tool) Inspect() string  { return "tool " + t.Impl.Name() }
+
+// Namespace groups the tools sharing a prefix (e.g. `http`). Member access on a
+// Namespace value resolves the named Tool (DESIGN.md §4).
+type Namespace struct {
+	Name    string
+	Members map[string]*Tool
+}
+
+func (n *Namespace) Type() ObjectType { return NAMESPACE_OBJ }
+func (n *Namespace) Inspect() string  { return "namespace " + n.Name }
+
+// ToAny converts a runtime value into a plain Go value that marshals to the
+// natural JSON shape (int/float/bool/string/null/array/object). It is the bridge
+// the run-result envelope and the effect log use to serialize results (DESIGN.md
+// §9). Non-data values (functions, builtins, tools, namespaces, errors) render to
+// their Inspect string, since they have no JSON-native form.
+func ToAny(o Object) any {
+	switch v := o.(type) {
+	case nil:
+		return nil
+	case *Null:
+		return nil
+	case *Integer:
+		return v.Value
+	case *Float:
+		return v.Value
+	case *Boolean:
+		return v.Value
+	case *String:
+		return v.Value
+	case *Array:
+		out := make([]any, 0, len(v.Elements))
+		for _, e := range v.Elements {
+			out = append(out, ToAny(e))
+		}
+		return out
+	case *Hash:
+		out := make(map[string]any, len(v.Keys))
+		for _, k := range v.Keys {
+			out[k] = ToAny(v.Pairs[k])
+		}
+		return out
+	default:
+		return o.Inspect()
+	}
 }
